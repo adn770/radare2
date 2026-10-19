@@ -30,6 +30,7 @@ r_asm_sources = [
   '../arch/p/hppa/pseudo.c',
   '../arch/p/dalvik/pseudo.c',
   '../arch/p/chip8/pseudo.c',
+  '../arch/p/usse/pseudo.c',
   '../arch/p/bpf/pseudo.c',
   '../arch/p/6502/pseudo.c',
   '../arch/p/8051/pseudo.c',

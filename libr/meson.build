@@ -474,6 +474,7 @@ io_plugins += [
     'sparc',
     'tms320',
     'tricore',
+    'usse',
     'v850',
     'vax',
     'x86',
