@@ -341,6 +341,7 @@ extern const RArchPlugin r_arch_plugin_tms320;
 extern const RArchPlugin r_arch_plugin_tms320_gnu;
 extern const RArchPlugin r_arch_plugin_tricore;
 extern const RArchPlugin r_arch_plugin_tricore_cs;
+extern const RArchPlugin r_arch_plugin_usse;
 extern const RArchPlugin r_arch_plugin_uxn;
 extern const RArchPlugin r_arch_plugin_v810;
 extern const RArchPlugin r_arch_plugin_v850;

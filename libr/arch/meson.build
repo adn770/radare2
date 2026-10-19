@@ -15,6 +15,8 @@ r_arch_sources = [
   'p/pic/pic_baseline.c',
   'p/pic/pic_pic18.c',
   'p/chip8/plugin.c',
+  'p/usse/plugin.c',
+  'p/usse/usse.c',
   'p/bpf/plugin.c',
   'p/bpf_cs/plugin.c',
   'p/ppc/libvle/vle.c',

@@ -189,6 +189,7 @@ if get_option('plugins') == ''
     'sparc_cs',
     'tms320',
     'tricore_cs',
+    'usse',
     'v810',
     'wasm',
     'ws',
