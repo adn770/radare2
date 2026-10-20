@@ -1,23 +1,27 @@
-# PowerVR SGX Series-5 USSE disassembler tests
+# PowerVR SGX Series-5 USSE assembler and disassembler tests
 # (instructions written for these tests, not taken from firmware; arch=usse, bits=32)
-d "mov r23, #0x5A3C0F81" 810ffc02106121fc
-d "stad.bpcache [sa3,+#9], r12" 8cc40080060026f0
-d "ba #0x00000A52" 520a0000000000f8
-d "nop.nosched.end" 00000000400904f8
-d "and.testtaz.chan0 !c0, p1, r9, #20" 94040c2085110948
-d "shl r5, r11, #0x00000007" 8705a02000100160
-d "or r4, r9, r30" 9e04800008100050
-d "ldr r6, #1023, drc1" 7fc0c120010021fe
-d "shr r14, r3, #0x00000000" 8001c02100100168
-d "ldad.bpcache r7, [sa2,+#5], drc1" 8082e0a0070027e8
-d "imae.u r9, r4.low, #3.low, r9, u32" 89012181800002a8
-d "str #77, r8" 4d040020000029fe
-d "xor.testtaz.chan0 !c0, p2, r12, #6" 06860c2089110948
-d "rol r3, r8, #0x0000000B" 0b04602008100160
-d "isub16.testtaz.chan0 r6, p1, r6, #3" 03c3d52084110148
-d "!p1 br #0x00000031" 31000000400000fe
-d "ima16.s r17, r18, #1, r19.neg, u16, u16" 93802482000822a0
-d "iaddu32.testtaz.chan0 r10, p1, #1, r10" 8a40578184110248
-d "ima32.u r6, r11, r5, r8" 88c2c200000000d0
-d "ldaw.bpcache r22, [r14,+#5], drc0" 8082c3a2120023e8
-d "isubu16.testtanz.chan0 r20, p3, r20, #2" 028a96228c120148
+ad "mov r23, #0x5A3C0F81" 810ffc02106121fc
+ad "stad.bpcache [sa3,+#9], r12" 8cc40080060026f0
+ad "ba #0x00000A52" 520a0000000000f8
+ad "nop.nosched.end" 00000000400904f8
+ad "nop.syncs.end" 00000000400184f8
+ad "and.testtaz.chan0 !c0, p1, r9, #20" 94040c2085110948
+ad "shl r5, r11, #0x00000007" 8705a02000100160
+ad "or r4, r9, r30" 9e04800008100050
+ad "ldr r6, #1023, drc1" 7fc0c120010021fe
+ad "shr r14, r3, #0x00000000" 8001c02100100168
+ad "ldad.bpcache r7, [sa2,+#5], drc1" 8082e0a0070027e8
+ad "imae.u r9, r4.low, #3.low, r9, u32" 89012181800002a8
+ad "str #77, r8" 4d040020000029fe
+ad "phas #5, #8, pixel, end, parallel" 05000000020744fa
+ad "xor.testtaz.chan0 !c0, p2, r12, #6" 06860c2089110948
+ad "rol r3, r8, #0x0000000B" 0b04602008100160
+ad "isub16.testtaz.chan0 r6, p1, r6, #3" 03c3d52084110148
+ad "!p1 br #0x00000031" 31000000400000fe
+ad "ima16.s r17, r18, #1, r19.neg, u16, u16" 93802482000822a0
+ad "ima16.s r5, r7, #2, r3.neg, u16, u16" 03c1a180000822a0
+ad "iaddu32.testtaz.chan0 r10, p1, #1, r10" 8a40578184110248
+ad "iaddu32.testtaz.chan0 r10, p1, #4, r10" 0a42578184110248
+ad "ima32.u r6, r11, r5, r8" 88c2c200000000d0
+ad "ldaw.bpcache r22, [r14,+#5], drc0" 8082c3a2120023e8
+ad "isubu16.testtanz.chan0 r20, p3, r20, #2" 028a96228c120148

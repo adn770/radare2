@@ -12,6 +12,7 @@
 #include <r_util.h>
 #include <stdlib.h>
 #include "usse.h"
+#include "usse_form.h"
 #include "memop.h"
 
 /* ---- register profile ---------------------------------------------------- */
@@ -260,6 +261,26 @@ static int archinfo(RArchSession *as, ut32 q) {
 	return 8;
 }
 
+/* The inverse of decode, on the same form table: any text the decoder prints
+ * assembles back (rasm2 -a usse, pa, wa). */
+static bool usse_encode_cb(RArchSession *as, RAnalOp *op, RArchEncodeMask mask) {
+	uint64_t e;
+	ut8 *buf;
+
+	if (!op->mnemonic || !usse_form_encode (op->mnemonic, &e)) {
+		return false;
+	}
+	buf = malloc (8);
+	if (!buf) {
+		return false;
+	}
+	r_write_le64 (buf, e);
+	free (op->bytes);
+	op->bytes = buf;
+	op->size = 8;
+	return true;
+}
+
 const RArchPlugin r_arch_plugin_usse = {
 	.meta = {
 		.name = "usse",
@@ -273,6 +294,7 @@ const RArchPlugin r_arch_plugin_usse = {
 	.info = archinfo,
 	.regs = regs,
 	.decode = usse_decode_cb,
+	.encode = usse_encode_cb,
 };
 
 #ifndef R2_PLUGIN_INCORE

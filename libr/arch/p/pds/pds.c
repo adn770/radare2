@@ -40,6 +40,10 @@ static const char *special(unsigned i, int with_pc) {
     return i < 4 ? PLAIN[i] : NULL;
 }
 
+const char *pds_pred_name(unsigned p) { return p < 8 ? PRED[p] : NULL; }
+const char *pds_movs_dst_name(unsigned d) { return d < 16 ? MOVS_DST[d] : NULL; }
+const char *pds_special_name(unsigned i, int with_pc) { return special(i, with_pc); }
+
 /* 7-bit destination: ds0[0-63], ds1[0-63]. */
 static void dst7(out_t *o, unsigned v) {
     put(o, "ds%u[%u]", v >> 6, v & 0x3f);

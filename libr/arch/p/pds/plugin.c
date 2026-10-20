@@ -11,6 +11,7 @@
 #include <r_lib.h>
 #include <r_util.h>
 #include "pds.h"
+#include "pds_asm.h"
 
 static int op_type(uint32_t w) {
 	const int cond = pds_predicated (w);
@@ -65,6 +66,46 @@ static bool pds_decode_cb(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 	return true;
 }
 
+/*
+ * The inverse of decode: any text pds_decode prints assembles back. A
+ * predicated instruction is spelt "(p0) ..."; r_asm strips leading separators,
+ * '(' among them, before an assembler sees the line, so restore it.
+ */
+static bool pds_encode_cb(RArchSession *as, RAnalOp *op, RArchEncodeMask mask) {
+	static const char *const preds[] = { "p0)", "p1)", "p2)", "if0)", "if1)", "aluz)", "alun)" };
+	const char *text = op->mnemonic;
+	char *fixed = NULL;
+	uint32_t w;
+	ut8 *buf;
+	size_t i;
+	bool ok;
+
+	if (!text) {
+		return false;
+	}
+	for (i = 0; i < R_ARRAY_SIZE (preds); i++) {
+		if (r_str_startswith (text, preds[i])) {
+			fixed = r_str_newf ("(%s", text);
+			text = fixed;
+			break;
+		}
+	}
+	ok = text && pds_encode (text, &w);
+	free (fixed);
+	if (!ok) {
+		return false;
+	}
+	buf = malloc (4);
+	if (!buf) {
+		return false;
+	}
+	r_write_le32 (buf, w);
+	free (op->bytes);
+	op->bytes = buf;
+	op->size = 4;
+	return true;
+}
+
 static int archinfo(RArchSession *as, ut32 q) {
 	return 4;
 }
@@ -81,6 +122,7 @@ const RArchPlugin r_arch_plugin_pds = {
 	.endian = R_SYS_ENDIAN_LITTLE,
 	.info = archinfo,
 	.decode = pds_decode_cb,
+	.encode = pds_encode_cb,
 };
 
 #ifndef R2_PLUGIN_INCORE

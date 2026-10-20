@@ -1,5 +1,6 @@
 OBJ_USSE=p/usse/plugin.o
 OBJ_USSE+=p/usse/usse.o
+OBJ_USSE+=p/usse/usse_form.o
 
 STATIC_OBJ+=$(OBJ_USSE)
 TARGET_USSE=arch_usse.$(EXT_SO)

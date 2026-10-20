@@ -14,6 +14,14 @@
  * decoded; 0 for reserved/unknown encodings, with text set to ".word 0x…". */
 int pds_decode(uint32_t w, char *text, unsigned len);
 
+/* The decoder's register and predicate names, shared with the assembler
+ * (tools/usse-asm): the predicate of w[26:24] (NULL for 7, always), the
+ * movs/movsa destination port (NULL if reserved), and the input/special
+ * register by index, in the numbering with or without pc (NULL past the end). */
+const char *pds_pred_name(unsigned p);
+const char *pds_movs_dst_name(unsigned d);
+const char *pds_special_name(unsigned i, int with_pc);
+
 /* Coarse instruction category, for an analysis frontend (e.g. the r2 plugin).
  * PDS_T_IO is a movs/movsa to a dout* port: it issues work to another unit
  * (doutu starts a USSE task, doutd a DMA, douta writes attributes). */

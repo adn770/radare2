@@ -23,6 +23,10 @@ typedef struct {
  * branch-target resolution). Always fills out->text (".long 0x…" if unknown). */
 void usse_decode(uint64_t enc, uint32_t pc, usse_insn *out);
 
+/* Select the core whose reading the decoder (and assembler) follows: 545
+ * (the default) or 540. They differ in the load/store cache bits. */
+void usse_set_core(int core);
+
 /* Base mnemonic for a top-5-bit opcode class, or NULL if unmapped. */
 const char *usse_class_name(unsigned top5);
 

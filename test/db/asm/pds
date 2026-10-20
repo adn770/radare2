@@ -1,35 +1,45 @@
-# PowerVR SGX PDS (Programmable Data Sequencer) disassembler tests
+# PowerVR SGX PDS (Programmable Data Sequencer) assembler and disassembler tests
 # (instructions written for these tests, not taken from firmware; arch=pds, bits=32)
-d "movs doutu, ds0[2], ds0[3], ds1[5], ds0[2]" 85430407
-d "movs doutu, ds1[7], ds0[4], ds0[5], ds0[4]" 85780807
-d "movs doutd, ds0[6], ds0[7], ds0[6], ds0[6]" 03020c07
-d "movs douta, ir1.l, ds1[3], ir1.l, ir1.l" 06268407
-d "movs douta, tim.l, ds1[7], tim.l, tim.l" 06668807
-d "(p1) halt" 000000a9
-d "tstz p1, ir1" 01008287
-d "tstz p2, ds1[52]" 02d10087
-d "(p1) tstz p0, ir1" 00008281
-d "(p1) bra 0x00000011" 11000091
-d "bra 0x0000004B" 4b000097
-d "and ds0[50], ir0, ds1[11]" 322c80cf
-d "and ds1[49], ds0[53], ds1[2]" 71086acf
-d "xor ds1[51], ds0[49], ds1[55]" 73dc62d7
-d "(p2) xor ds1[51], ds0[49], ds1[55]" 73dc62d2
-d "mov16 ds0[5], ds0[9].h" 0513000f
-d "mov32 ds0[7], tim" 0e060117
-d "mov64 ds1[6], mr01" 8c00011f
-d "mov128 ds[8], ds[16], swap" 10210027
-d "load 0x00000000, ds0[50-52]" 00000833
+# Words with ignored bits set are disassembly tests next to their canonical form.
+ad "movs doutu, ds0[2], ds0[3], ds1[5], ds0[2]" 85430407
+ad "movs doutu, ds1[7], ds0[4], ds0[5], ds0[4]" 85780807
+ad "movs doutd, ds0[6], ds0[7], ds0[6], ds0[6]" 03020c07
+ad "movs douta, ir1.l, ds1[3], ir1.l, ir1.l" 06268407
+ad "movs douta, tim.l, ds1[7], tim.l, tim.l" 06668807
+ad "(p1) halt" 000000a9
+ad "tstz p1, ir1" 01008287
+ad "tstz p2, ds1[52]" 02d10087
+ad "(p1) tstz p0, ir1" 00008281
+ad "(p1) bra 0x00000011" 11000091
+ad "bra 0x0000004B" 4b000097
+ad "and ds0[50], ir0, ds1[11]" 322c80cf
+ad "and ds1[49], ds0[53], ds1[2]" 71086acf
+ad "xor ds1[51], ds0[49], ds1[55]" 73dc62d7
+ad "(p2) xor ds1[51], ds0[49], ds1[55]" 73dc62d2
+ad "mov16 ds0[5], ds0[9].h" 0513000f
+ad "mov32 ds0[7], tim" 0e060117
+ad "mov64 ds1[6], mr01" 8c00011f
+ad "mov128 ds[8], ds[16], swap" 10210027
+ad "load 0x00000000, ds0[50-52]" 00000833
 d "load 0x0003A51C, ds1[60]" 47e9f031
+ad "load 0x0003A51C, ds1[60]" 47e97031
 d "store 0x00012F48, ds0[49-51]" d24b843b
+ad "store 0x00012F48, ds0[49-51]" d24b043b
 d "(p1) mul ds1[21], ds0[6].h, ds1[13].h" 55370d61
+ad "(p1) mul ds1[21], ds0[6].h, ds1[13].h" 55360d61
 d "(p1) abs ds1[41], ds1[22]" 69d99c69
+ad "(p1) abs ds1[41], ds1[22]" 69590069
 d "(if1) not ds0[19], tim" 939e85dc
+ad "(if1) not ds0[19], tim" 130084dc
 d "rwfence" 0100007d
+ad "rwfence" 01000078
 d "nop" 2b9a36b0
-d "(p1) alum signed" 010000b9
-d "call 0x00000ABC" bc0a009f
-d "(p2) shl ds1[17], ds0[3], 45" 512d03f2
+ad "nop" 000000b0
+ad "(p1) alum signed" 010000b9
+ad "call 0x00000ABC" bc0a009f
+ad "(p2) shl ds1[17], ds0[3], 45" 512d03f2
 d "shr ds1[60], ds0[2], 0" fc0002ff
+ad "shr ds1[60], ds0[2], 0" 7c0002ff
 d "tstn , ds0[2]" 0400048f
+ad "tstn , ds0[2]" 0300048f
 d "invalid" 3c5a1e70
