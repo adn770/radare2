@@ -1,0 +1,34 @@
+NAME=USSE pseudo fetch and increment forms show the accessed elements
+FILE=malloc://256
+ARGS=-a usse -b 32 -e asm.pseudo=true
+CMDS=<<EOF
+wx 804121a1023003e8804980a0021003e88a820180023002f080c000a100022be8004000a1026203e88cd20180021202f0008061a1021203ea004001a002f203f00000a1a100020be8
+pi 9
+EOF
+EXPECT=<<EOF
+r9..r12 = mem[r5 + 4..7]
+r4..r5 = mem[r1 + 20..21]
+mem[r6 + 6..9] = r10..r13
+r8 = mem[r3]; r3 += 1
+r8..r14 = mem[r1 + 0..6]; r1 += 7
+mem[r7 + 37..38] = r12..r13; r7 += 2
+if (p1) { r11..r12 = mem[r6 + 0..1]; r6 += 2 }
+mem[r5 + 0..15] = #0; r5 += 16
+r13 = mem[r4 + 0]; r4 += 1
+EOF
+RUN
+
+NAME=USSE pseudo plain load/store forms
+FILE=malloc://256
+ARGS=-a usse -b 32 -e asm.pseudo=true
+CMDS=<<EOF
+wx 03820180020022f000c3e0a1030023e80081c1a00a0023e800c80223000029e8
+pi 4
+EOF
+EXPECT=<<EOF
+mem[r6 + 4] = r3
+r15 = mem[r3 + 6]
+r6 = mem[r6 - 2]
+r24 = mem[r11 + r16]
+EOF
+RUN

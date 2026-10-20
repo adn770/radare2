@@ -12,6 +12,7 @@
 #include <r_util.h>
 #include <stdlib.h>
 #include "usse.h"
+#include "memop.h"
 
 /* ---- register profile ---------------------------------------------------- */
 static char *regs(RArchSession *s) {
@@ -25,8 +26,9 @@ static char *regs(RArchSession *s) {
  * We parse our own regular mnemonic text (never the raw bits) into predicate +
  * base-op + args, then fill op->val / op->direction and, for the control
  * subset, op->esil. Conservative: only clean reg/#imm operands are modelled;
- * flagged/complex forms (test-predicate, memory ++/reg-offset, fmad, imae, ...)
- * are left without ESIL. */
+ * flagged/complex forms (test-predicate, register-offset memory, fmad, imae,
+ * ...) are left without ESIL. Loads/stores follow memop.h, including the
+ * fetch forms' extra element and the post-increment writeback. */
 
 static bool simple_tok(const char *t) {
 	if (!t || !*t) {
@@ -54,32 +56,53 @@ static const char *esil_tok(const char *t) {
 	return (*t == '#') ? t + 1 : t;
 }
 
-/* Parse "[base,(+)#off]" -> base reg + byte offset (off is in dwords, *4).
- * Rejects register offsets and post-increment ("++"). */
-static bool mem_parse(const char *a, char *base, size_t bsz, ut64 *byteoff) {
-	if (*a != '[') {
+/* ESIL for a load/store whose addresses are fully known (memop.h). */
+static bool mem_esil(const UsseMemOp *m, RStrBuf *sb) {
+	if (!usse_memop_modelled (m) || (m->load && *m->data == '#')) {
 		return false;
 	}
-	char tmp[64];
-	snprintf (tmp, sizeof tmp, "%s", a + 1);
-	char *rb = strchr (tmp, ']');
-	if (rb) {
-		*rb = 0;
+	const int s = m->size;
+	const int n = m->fetch ? m->fetch : 1;
+	bool wneg;
+	const ut64 wb = usse_memop_writeback (m, &wneg);
+	char reg[24];
+	int i;
+	if (m->load) {
+		/* a destination that is also the base would be clobbered mid-sequence */
+		for (i = 0; i < n; i++) {
+			if (!usse_reg_nth (m->data, i, reg, sizeof reg)) {
+				return false;
+			}
+			if (!strcmp (reg, m->base) && (wb || i < n - 1)) {
+				return false;
+			}
+		}
 	}
-	char *comma = strchr (tmp, ',');
-	if (!comma) {
-		return false;
+	if (!m->fetch && m->mode == USSE_AM_PRE) {
+		r_strbuf_appendf (sb, "%"PFMT64u",%s,%s=,", m->k * s, m->base, m->neg ? "-" : "+");
 	}
-	*comma = 0;
-	char *off = comma + 1;
-	if (*off == '+') {
-		off++;
+	for (i = 0; i < n; i++) {
+		char addr[48];
+		if (m->fetch) {
+			snprintf (addr, sizeof addr, "%"PFMT64u",%s,+", usse_memop_elem (m, i) * s, m->base);
+		} else if (m->mode == USSE_AM_NONE) {
+			snprintf (addr, sizeof addr, "%"PFMT64u",%s,%s", m->k * s, m->base, m->neg ? "-" : "+");
+		} else {
+			snprintf (addr, sizeof addr, "%s", m->base);
+		}
+		if (!usse_reg_nth (m->data, i, reg, sizeof reg)) {
+			return false;
+		}
+		const char *src = (*reg == '#') ? reg + 1 : reg;
+		if (m->load) {
+			r_strbuf_appendf (sb, "%s%s,[%d],%s,=", i ? "," : "", addr, s, reg);
+		} else {
+			r_strbuf_appendf (sb, "%s%s,%s,=[%d]", i ? "," : "", src, addr, s);
+		}
 	}
-	if (*off != '#' || strstr (off, "++")) {
-		return false; /* register offset or post-increment: not modelled */
+	if (wb && (m->fetch || m->mode == USSE_AM_POST)) {
+		r_strbuf_appendf (sb, ",%"PFMT64u",%s,%s=", wb * s, m->base, wneg ? "-" : "+");
 	}
-	snprintf (base, bsz, "%s", tmp);
-	*byteoff = (ut64) strtoull (off + 1, NULL, 0) * 4;
 	return true;
 }
 
@@ -145,9 +168,6 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 
 	char e[192];
 	e[0] = 0;
-	char mbase[64];
-	ut64 moff;
-
 	if (!strcmp (base, "mov") && argc == 2 && simple_tok (args[0]) && simple_tok (args[1])) {
 		snprintf (e, sizeof e, "%s,%s,=", esil_tok (args[1]), args[0]);
 	} else if ((!strcmp (base, "and") || !strcmp (base, "or") || !strcmp (base, "xor"))
@@ -158,12 +178,6 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 			&& argc == 3 && simple_tok (args[0]) && simple_tok (args[1]) && simple_tok (args[2])) {
 		const char *sym = !strcmp (base, "shl") ? "<<" : ">>";
 		snprintf (e, sizeof e, "%s,%s,%s,%s,=", esil_tok (args[2]), esil_tok (args[1]), sym, args[0]);
-	} else if ((!strcmp (base, "ldad") || !strcmp (base, "ldaw")) && argc >= 2
-			&& simple_tok (args[0]) && mem_parse (args[1], mbase, sizeof mbase, &moff)) {
-		snprintf (e, sizeof e, "%"PFMT64u",%s,+,[4],%s,=", moff, mbase, args[0]);
-	} else if ((!strcmp (base, "stad") || !strcmp (base, "staw")) && argc >= 2
-			&& simple_tok (args[1]) && mem_parse (args[0], mbase, sizeof mbase, &moff)) {
-		snprintf (e, sizeof e, "%s,%"PFMT64u",%s,+,=[4]", esil_tok (args[1]), moff, mbase);
 	} else if ((!strcmp (base, "ba") || !strcmp (base, "br")) && argc == 1) {
 		if (strstr (opw, "savelink")) {
 			snprintf (e, sizeof e, "8,pc,+,pclink,=,0x%"PFMT64x",pc,=", op->jump);
@@ -172,13 +186,24 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 		}
 	}
 
-	if (e[0]) {
-		if (cond[0]) {
-			r_strbuf_setf (&op->esil, "%s,%s?{,%s,}", cond, neg ? "!," : "", e);
-		} else {
-			r_strbuf_set (&op->esil, e);
+	UsseMemOp mo;
+	RStrBuf *mb = NULL;
+	if (!e[0] && argc >= 2 && usse_memop_parse (opw, args[0], args[1], &mo)) {
+		mb = r_strbuf_new ("");
+		if (!mem_esil (&mo, mb)) {
+			r_strbuf_free (mb);
+			mb = NULL;
 		}
 	}
+	const char *body_esil = mb ? r_strbuf_get (mb) : e;
+	if (body_esil[0]) {
+		if (cond[0]) {
+			r_strbuf_setf (&op->esil, "%s,%s?{,%s,}", cond, neg ? "!," : "", body_esil);
+		} else {
+			r_strbuf_set (&op->esil, body_esil);
+		}
+	}
+	r_strbuf_free (mb);
 	free (s);
 }
 

@@ -1,0 +1,49 @@
+NAME=USSE ESIL for load/store addressing forms
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 804121a1023003e88a820180023002f080c000a100022be88cd20180021202f0008061a1021203ea0081c1a00a0023e800c3e0a1030023e88083a4a2120023e8
+e asm.esil=true
+pi 8
+EOF
+EXPECT=<<EOF
+16,r5,+,[4],r9,=,20,r5,+,[4],r10,=,24,r5,+,[4],r11,=,28,r5,+,[4],r12,=
+r10,24,r6,+,=[4],r11,28,r6,+,=[4],r12,32,r6,+,=[4],r13,36,r6,+,=[4]
+r3,[4],r8,=,4,r3,+=
+r12,148,r7,+,=[4],r13,152,r7,+,=[4],8,r7,+=
+p1,?{,0,r6,+,[4],r11,=,4,r6,+,[4],r12,=,8,r6,+=,}
+8,r6,-,[4],r6,=
+24,r3,+,[4],r15,=
+14,r18,+,[2],r21,=
+EOF
+RUN
+
+NAME=USSE ESIL emulates fetch offsets (CCB command fetch, base+offset fetch)
+FILE=malloc://0x1000
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 8040e0a000022be8004000a1026203e800c143a0023003e8
+wx a0000000a1000000a2000000a3000000a4000000a5000000a6000000a7000000 @ 0x100
+aei
+aeim
+ar r1=0x100
+ar r15=0x100
+aes
+aes
+ar r7
+ar r8
+ar r14
+ar r1
+aes
+ar r2
+ar r5
+EOF
+EXPECT=<<EOF
+0x000000a0
+0x000000a1
+0x000000a7
+0x00000120
+0x000000a3
+0x000000a6
+EOF
+RUN

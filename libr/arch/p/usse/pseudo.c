@@ -3,20 +3,26 @@
 #include <r_lib.h>
 #include <r_util.h>
 #include <r_asm.h>
+#include "memop.h"
 
 /* Rewrite a decoded USSE instruction into a pseudo-C-ish form, e.g.
  *   mov r0, r1              -> r0 = r1
  *   and r0, r1, r2          -> r0 = r1 & r2
  *   fmad r0, r1, r2, r3     -> r0 = r1 * r2 + r3
  *   imae r0, r1, r2, r3     -> r0 = r1 * r2 + r3
- *   ldad.fcfill r4,[r0,#1++] -> r4 = mem[r0 + 1++]
  *   stad.bpcache [sa1,+#14],r16 -> mem[sa1 + 14] = r16
+ *   ldad.fcfill r4,[r0,#1++] -> r4 = mem[r0]; r0 += 1
+ *   ldad.fetch4 r3,[r2,+#1]  -> r3..r6 = mem[r2 + 2..5]
+ *   ldad.fetch7 r5,[r0,#0++] -> r5..r11 = mem[r0 + 0..6]; r0 += 7
  *   ba #0x20                -> goto 0x20
  *   ba.savelink #0x20       -> call 0x20
  *   p0 mov r0, r1           -> if (p0) r0 = r1
  * Conservative: only the forms above are rewritten; anything else (test-
  * predicate ALU, smlsi, ci/cfi, ...) is passed through unchanged (return NULL).
- * Memory offsets mirror the disassembly (dword index), not bytes. */
+ * Memory indices are in elements of the access size (dwords for ldad/stad),
+ * not bytes, and name the elements actually accessed (memop.h): a fetch with
+ * a base+offset address starts one element after the printed offset. Fetch
+ * forms memop.h does not model are passed through unchanged. */
 
 static const char *binop(const char *op) {
 	if (!strcmp (op, "and")) return "&";
@@ -38,13 +44,72 @@ static char *memref(const char *a) {
 		*rb = 0;
 	}
 	s = r_str_replace (s, ",+#", " + ", 1);
+	s = r_str_replace (s, ",-#", " - ", 1);
 	s = r_str_replace (s, ",#", " + ", 1);
 	s = r_str_replace (s, ",+", " + ", 1);
+	s = r_str_replace (s, ",-", " - ", 1);
 	s = r_str_replace (s, ",", " + ", 1);
 	s = r_str_replace (s, "#", "", 1);
 	char *out = r_str_newf ("mem[%s]", s);
 	free (s);
 	return out;
+}
+
+/* Fetch and increment forms: name the accessed elements and the writeback.
+ * Returns NULL for plain base+offset forms (memref handles those) and sets
+ * *skip for forms that are not modelled. */
+static char *mem_pseudo(const UsseMemOp *m, bool *skip) {
+	*skip = false;
+	if (!m->fetch && m->mode == USSE_AM_NONE) {
+		return NULL;
+	}
+	if (!usse_memop_modelled (m)) {
+		*skip = true;
+		return NULL;
+	}
+	const int n = m->fetch ? m->fetch : 1;
+	char last[24];
+	char data[56];
+	if (!usse_reg_nth (m->data, n - 1, last, sizeof last)) {
+		*skip = true;
+		return NULL;
+	}
+	if (n > 1 && *m->data != '#') {
+		snprintf (data, sizeof data, "%s..%s", m->data, last);
+	} else {
+		snprintf (data, sizeof data, "%s", m->data);
+	}
+	char mem[64];
+	if (m->fetch) {
+		ut64 e0 = usse_memop_elem (m, 0);
+		if (n > 1) {
+			snprintf (mem, sizeof mem, "mem[%s + %"PFMT64u"..%"PFMT64u"]",
+				m->base, e0, usse_memop_elem (m, n - 1));
+		} else {
+			snprintf (mem, sizeof mem, "mem[%s + %"PFMT64u"]", m->base, e0);
+		}
+	} else {
+		snprintf (mem, sizeof mem, "mem[%s]", m->base);
+	}
+	RStrBuf *sb = r_strbuf_new ("");
+	bool wneg;
+	const ut64 wb = usse_memop_writeback (m, &wneg);
+	char inc[48] = {0};
+	if (wb) {
+		snprintf (inc, sizeof inc, "%s %s= %"PFMT64u, m->base, wneg ? "-" : "+", wb);
+	}
+	if (!m->fetch && m->mode == USSE_AM_PRE && wb) {
+		r_strbuf_appendf (sb, "%s; ", inc);
+	}
+	if (m->load) {
+		r_strbuf_appendf (sb, "%s = %s", data, mem);
+	} else {
+		r_strbuf_appendf (sb, "%s = %s", mem, data);
+	}
+	if (m->mode == USSE_AM_POST && wb) {
+		r_strbuf_appendf (sb, "; %s", inc);
+	}
+	return r_strbuf_drain (sb);
 }
 
 static char *parse(RAsmPluginSession *aps, const char *data) {
@@ -102,6 +167,9 @@ static char *parse(RAsmPluginSession *aps, const char *data) {
 	RStrBuf *sb = r_strbuf_new ("");
 	bool ok = false;
 	const char *bo;
+	UsseMemOp mo;
+	char *mp = NULL;
+	bool mskip = false;
 	if (!strcmp (op, "mov") && argc == 2) {
 		r_strbuf_setf (sb, "%s = %s", args[0], args[1]);
 		ok = true;
@@ -111,6 +179,13 @@ static char *parse(RAsmPluginSession *aps, const char *data) {
 	} else if ((!strcmp (op, "fmad") || !strcmp (base, "imae")) && argc == 4) {
 		r_strbuf_setf (sb, "%s = %s * %s + %s", args[0], args[1], args[2], args[3]);
 		ok = true;
+	} else if (argc >= 2 && usse_memop_parse (op, args[0], args[1], &mo)
+			&& ((mp = mem_pseudo (&mo, &mskip)) || mskip)) {
+		if (mp) {
+			r_strbuf_set (sb, mp);
+			free (mp);
+			ok = true;
+		}
 	} else if ((!strcmp (base, "ldad") || !strcmp (base, "ldaw")) && argc >= 2) {
 		char *m = memref (args[1]);
 		r_strbuf_setf (sb, "%s = %s", args[0], m);
@@ -133,7 +208,8 @@ static char *parse(RAsmPluginSession *aps, const char *data) {
 	if (ok) {
 		if (*cond) {
 			char *inner = r_strbuf_drain (sb);
-			out = r_str_newf ("if (%s) %s", cond, inner);
+			const bool multi = strchr (inner, ';') != NULL;
+			out = r_str_newf (multi ? "if (%s) { %s }" : "if (%s) %s", cond, inner);
 			free (inner);
 		} else {
 			out = r_strbuf_drain (sb);
