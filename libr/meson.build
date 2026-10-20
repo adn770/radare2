@@ -174,6 +174,7 @@ if get_option('plugins') == ''
     'mips_cs',
     'msp430',
     'or1k',
+    'pds',
     'pic',
     'ppc_cs',
     'propeller',

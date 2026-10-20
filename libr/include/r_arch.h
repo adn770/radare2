@@ -316,6 +316,7 @@ extern const RArchPlugin r_arch_plugin_nios2;
 extern const RArchPlugin r_arch_plugin_null;
 extern const RArchPlugin r_arch_plugin_or1k;
 extern const RArchPlugin r_arch_plugin_pdp11;
+extern const RArchPlugin r_arch_plugin_pds;
 extern const RArchPlugin r_arch_plugin_pic;
 extern const RArchPlugin r_arch_plugin_pickle;
 extern const RArchPlugin r_arch_plugin_ptx;
