@@ -47,3 +47,241 @@ EXPECT=<<EOF
 0x000000a6
 EOF
 RUN
+
+NAME=USSE ESIL for the test group (predicate from a 32-bit integer result)
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 10030c2085110948 09820c0089120848 9cc30c208d140948 0101bc2080110148 0841178184110248 82000c0001150848 82000c0081160848 86020c008511084a 83c00d2081140948 83400d2081120948
+e asm.esil=true
+pi 10
+EOF
+EXPECT=<<EOF
+16,r6,&,!,p1,=
+r9,r4,^,!,!,p2,=
+31,28,r7,<<,0xffffffff,&,>>,p3,=
+1,r2,&,!,p0,=,1,r2,&,r5,=
+r8,2,+,0xffffffff,&,!,p1,=,r8,2,+,0xffffffff,&,r8,=
+31,r2,r1,&,>>,r2,r1,&,!,|,p0,=
+31,r2,r1,&,>>,r2,r1,&,!,!,&,p0,=
+p1,?{,r6,r5,&,!,p1,=,}
+31,3,r1,ASR,0xffffffff,&,>>,p0,=
+3,r1,<<,29,r1,>>,|,0xffffffff,&,!,!,p0,=
+EOF
+RUN
+
+NAME=USSE ESIL for rotates, inverted sources and multiply-adds
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 8704202108100160 0401202008100168 8803c00000180050 0f01e481800002a8 81814281800802a8 8d024120800001a9 0505a300000000d0
+e asm.esil=true
+pi 7
+EOF
+EXPECT=<<EOF
+7,r9,<<,25,r9,>>,|,0xffffffff,&,r9,=
+4,r2,ASR,0xffffffff,&,r1,=
+r8,0xffffffff,^,r7,&,r6,=
+r15,2,r16,0xffff,&,*,+,r15,=
+r1,3,16,r10,0xffff,&,~,*,+,r10,=
+13,r5,0xffff,&,16,r4,>>,0xffff,&,*,+,r2,=
+r5,r10,r12,*,+,r5,=
+EOF
+RUN
+
+NAME=USSE ESIL for float multiply-add, reciprocal and square roots
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 8481200000002000 8481200000000000 84812000b8002000 0001200000100008 0001200040120008 0001200000100108 0001200020100008
+e asm.esil=true
+pi 7
+EOF
+EXPECT=<<EOF
+32,32,r4,F2D,32,r3,F2D,32,r2,F2D,F*,F+,D2F,r1,=
+32,32,r4,F2D,32,r3,F2D,32,r2,F2D,F*,F+,D2F,r1,=
+32,32,0x80000000,r4,|,F2D,32,0x80000000,r3,^,F2D,32,0x7fffffff,r2,&,F2D,F*,F+,D2F,r1,=
+32,32,r2,F2D,1,I2D,F/,D2F,r1,=
+32,32,0x7fffffff,r2,&,F2D,SQRT,1,I2D,F/,D2F,r1,=
+32,32,r2,F2D,SQRT,D2F,r1,=
+32,32,0x80000000,r2,^,F2D,1,I2D,F/,D2F,r1,=
+EOF
+RUN
+
+NAME=USSE ESIL leaves uncharacterised forms unmodelled
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 89c30c2085180948 84c4352188110148 82000c0091110848 82000c0081112848 82000c0081100848 8340778080140248 0001202000102128 0301200000102050 0301200004100050 82024100800400a8 8481200000400000 8481208000002200 0001200000160008 0001200000140008 0001200004100008 0001200000300008 0100800c000020fc 0301200008100068 0301200000180060 0301200000100057
+e asm.esil=true
+pi 20
+EOF
+EXPECT=<<EOF
+shl.testpat.chan0 !c0, p1, r7, #9
+isub16.testtaz.chan0 r9, p2, r9, #4
+and.testtaz.chan1 !c0, p0, r1, r2
+and.onceonly.testtaz.chan0 !c0, p0, r1, r2
+and.testtat.chan0 !c0, p0, r1, r2
+iaddu32.testnat.chan0 r3, p0, #1, r3
+mov.repeat2 r1, r2
+and.repeat2 r1, r2, r3
+and.partial r1, r2, r3
+imae.usat r2, r4.low, r5.low, r2, u32
+fmad.incs010 r1, r2, r3, r4
+fmad r1, r2, #3, r4
+fexp r1, r2
+flog r1, r2
+frcp.tpres r1, r2
+frcp r1.xy, r2
+mov r100, #0x00000001
+asr r1, r2, r3
+shl r1, r2, ~r3
+Pn and r1, r2, r3
+EOF
+RUN
+
+NAME=USSE ESIL emulates the test group predicates
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 10030c208511094809820c00891208489cc30c208d1409480101bc20801101480841178184110248
+aei
+aeim
+ar r2=0x12345678
+ar r4=0x12345678
+ar r6=0xffffffff
+ar r7=0x08
+ar r8=0xfffffffe
+ar r9=0xffffffff
+aes
+ar p1
+aes
+ar p2
+aes
+ar p3
+ar p0=0
+aes
+ar p0
+ar r5
+aes
+ar p1
+ar r8
+EOF
+EXPECT=<<EOF
+0x00000000
+0x00000001
+0x00000001
+0x00000001
+0x00000000
+0x00000001
+0x00000000
+EOF
+RUN
+
+NAME=USSE ESIL emulates integer rotate, shift and multiply-add
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 870420210810016004012020081001688803c0000018005081814281800802a80505a300000000d08d024120800001a9
+aei
+aeim
+ar r9=0x80000001
+ar r2=0x80000000
+ar r7=0xff
+ar r8=0x0f
+ar r10=0x1234fffe
+ar r12=3
+ar r5=1
+ar r4=0x00070000
+aes 6
+ar r9
+ar r1
+ar r6
+ar r10
+ar r5
+ar r2
+EOF
+EXPECT=<<EOF
+0x000000c0
+0xf8000000
+0x000000f0
+0xf7fffffa
+0xe7ffffef
+0x0006ff96
+EOF
+RUN
+
+NAME=USSE ESIL emulates float multiply-add, reciprocal and square roots
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 848120000000200084812000b80020000001200000100008000120004012000800012000001001080001200020100008
+aei
+aeim
+ar r2=0x40000000
+ar r3=0x40400000
+ar r4=0x3f800000
+aes
+ar r1
+aes
+ar r1
+aes
+ar r1
+aes
+ar r1
+aes
+ar r1
+aes
+ar r1
+EOF
+EXPECT=<<EOF
+0x40e00000
+0xc0e00000
+0x3f000000
+0x3f3504f3
+0x3fb504f3
+0xbf000000
+EOF
+RUN
+
+NAME=USSE ESIL calls and returns through pclink (an instruction index)
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 02000000000200f800000000400180f800c3a500800000f800000000800000f9
+e asm.esil=true
+pi 4
+aei
+aeim
+aes
+ar pc
+ar pclink
+aes
+ar pc
+EOF
+EXPECT=<<EOF
+3,pc,>>,pclink,=,0x10,pc,=
+nop.syncs
+3,pclink,<<,pc,=
+p0,?{,3,pclink,<<,pc,=,}
+0x00000010
+0x00000001
+0x00000008
+EOF
+RUN
+
+NAME=USSE ESIL only names registers of the profile in loads and stores
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx c6800080000022f0 8080c0a7003003e8 80806ea0000027e8 8080c0a7001003e8
+e asm.esil=true
+pi 4
+EOF
+EXPECT=<<EOF
+stad [r2,+#1], r70
+ldad.fetch4 r62, [r2,+#1], drc0
+ldad r3, [o58,+#1], drc0
+8,r2,+,[4],r62,=,12,r2,+,[4],r63,=
+EOF
+RUN
