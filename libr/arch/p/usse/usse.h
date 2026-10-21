@@ -13,10 +13,13 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* The longest instruction text (efo and smlsi with immediates reach past 191). */
+#define USSE_TEXT_MAX 256
+
 typedef struct {
     int      valid;          /* 1 if fully decoded, 0 if opcode unknown */
     uint64_t enc;            /* the raw 64-bit instruction word */
-    char     text[128];      /* decoded mnemonic + operands (oracle-compatible) */
+    char     text[USSE_TEXT_MAX]; /* decoded mnemonic + operands (oracle-compatible) */
 } usse_insn;
 
 /* Decode one 64-bit USSE word. `pc` is the instruction index (for future
@@ -35,7 +38,7 @@ const char *usse_class_name(unsigned top5);
 typedef enum {
     USSE_T_UNK = 0, USSE_T_MOV, USSE_T_ALU, USSE_T_MUL,
     USSE_T_LOAD, USSE_T_STORE, USSE_T_JMP, USSE_T_CJMP,
-    USSE_T_CALL, USSE_T_NOP, USSE_T_SYNC
+    USSE_T_CALL, USSE_T_NOP, USSE_T_SYNC, USSE_T_RET, USSE_T_CRET
 } usse_op_type;
 
 usse_op_type usse_classify(uint64_t enc);

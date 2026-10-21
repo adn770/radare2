@@ -1,6 +1,7 @@
 /* usse_form.c — decode and encode USSE words with the form table (see
  * usse_form.h). Generic kinds (enumerations and numbers) live here; the
  * USSE-specific operand kinds live with the table in usse.c. */
+#include "usse.h"
 #include "usse_form.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -189,14 +190,92 @@ static const char *lit(const char *x, size_t len, const char *s) {
     return s;
 }
 
+/* ---- searched fields: printed once, indexed by first character --------- *
+ * A field whose kind has no parser is inverted by searching its values for
+ * one that prints the input text. Printing up to 2^16 values per field per
+ * line made the assembler slow, so each (kind, width) is printed once and its
+ * values grouped by the lowercased first character of their text, in
+ * ascending order; empty texts, and texts that begin with a blank, a comma or
+ * a comment, which lit() matches loosely, go in a bucket tried at every
+ * character. Values
+ * that print the same text share a bucket, so the search still finds the
+ * same value. Not thread-safe; the tools are single-threaded. */
+#define KCACHE_MAX_W 16
+#define ANY 256
+
+typedef struct {
+    const usse_kind *k;
+    unsigned w;
+    char **text;                /* 2^w, NULL: the value does not print */
+    uint32_t *order;            /* values grouped by bucket */
+    uint32_t start[ANY + 2];    /* bucket b is order[start[b] .. start[b + 1]) */
+} kcache;
+
+/* Pointers, so an entry never moves: the search recurses while it holds one. */
+static kcache **kcaches;
+static size_t nkcaches;
+
+static unsigned bucket_of(const char *t) {
+    if (!*t || *t == ' ' || *t == ',' || *t == '/') return ANY;
+    return (unsigned)tolower((unsigned char)*t);
+}
+
+static const kcache *kcache_get(const usse_kind *k, unsigned w) {
+    for (size_t i = 0; i < nkcaches; i++)
+        if (kcaches[i]->k == k && kcaches[i]->w == w) return kcaches[i];
+    kcache **more = realloc(kcaches, (nkcaches + 1) * sizeof *kcaches);
+    if (!more) return NULL;
+    kcaches = more;
+    uint32_t n = 1u << w, count[ANY + 1] = { 0 }, fill[ANY + 1];
+    kcache *kc = calloc(1, sizeof *kc);
+    if (!kc) return NULL;
+    *kc = (kcache){ .k = k, .w = w };
+    kc->text = calloc(n, sizeof *kc->text);
+    kc->order = calloc(n, sizeof *kc->order);
+    if (!kc->text || !kc->order) {
+        free(kc->text);
+        free(kc->order);
+        free(kc);
+        return NULL;
+    }
+    for (uint32_t v = 0; v < n; v++) {
+        char buf[96];
+        if (!k->print(k, v, buf, sizeof buf)) continue;
+        kc->text[v] = strdup(buf);
+        if (kc->text[v]) count[bucket_of(buf)]++;
+    }
+    for (unsigned b = 0; b <= ANY; b++) {
+        kc->start[b + 1] = kc->start[b] + count[b];
+        fill[b] = kc->start[b];
+    }
+    for (uint32_t v = 0; v < n; v++)
+        if (kc->text[v]) kc->order[fill[bucket_of(kc->text[v])]++] = v;
+    kcaches[nkcaches++] = kc;
+    return kc;
+}
+
 static int finish(match_ctx *c) {
     const usse_form *fm = c->fm;
     uint64_t e = fm->val | (fm->dflt & ~usse_form_bits(fm));
     for (int i = 0; i < USSE_MAX_FIELDS && fm->f[i].k; i++)
         e = usse_field_put(&fm->f[i], e, c->v[i]);
+    /* Fields that share bits can overwrite each other's values and build a
+     * word that decodes as this form, but not as the input. A field may read
+     * back another value only if it prints the same text: some forms share
+     * bits on purpose, a reference whose register bits the field it names
+     * writes (class-27 dual issue). */
+    for (int i = 0; i < USSE_MAX_FIELDS && fm->f[i].k; i++) {
+        const usse_field *f = &fm->f[i];
+        uint32_t got_v = usse_field_get(f, e);
+        char a[96], b[96];
+        if (got_v == c->v[i]) continue;
+        if (!f->k->print(f->k, c->v[i], a, sizeof a) || !f->k->print(f->k, got_v, b, sizeof b) ||
+            strcmp(a, b))
+            return 0;
+    }
     /* The word must decode with this form's text (an earlier form may claim
      * it, or a field may not print); otherwise keep searching. */
-    char want[160], got[160];
+    char want[USSE_TEXT_MAX], got[USSE_TEXT_MAX];
     if (!usse_form_render(fm, e, want, sizeof want)) return 0;
     if (c->t->decode) {
         if (!c->t->decode(e, got, sizeof got)) return 0;
@@ -230,6 +309,29 @@ static int match(match_ctx *c, const char *p, const char *s) {
             /* Search the field's values for one that prints the text, trying
              * the form's preferred value (from dflt) first. */
             uint32_t pref = usse_field_get(f, c->fm->dflt);
+            const kcache *kc = w <= KCACHE_MAX_W ? kcache_get(f->k, w) : NULL;
+            if (kc) {
+                const unsigned bs[2] = { (unsigned)tolower((unsigned char)*s), ANY };
+                const char *q;
+                if (pref <= lim && kc->text[pref] &&
+                    (q = lit(kc->text[pref], strlen(kc->text[pref]), s))) {
+                    c->v[i] = pref;
+                    if (match(c, p, q)) return 1;
+                }
+                for (int j = 0; j < 2; j++) {
+                    if (j && bs[0] == ANY) break;
+                    for (uint32_t o = kc->start[bs[j]]; o < kc->start[bs[j] + 1]; o++) {
+                        uint32_t v = kc->order[o];
+                        if (v == pref) continue;
+                        q = lit(kc->text[v], strlen(kc->text[v]), s);
+                        if (q) {
+                            c->v[i] = v;
+                            if (match(c, p, q)) return 1;
+                        }
+                    }
+                }
+                return 0;
+            }
             for (uint64_t n = 0; n <= (uint64_t)lim + 1; n++) {
                 uint32_t v = n ? (uint32_t)(n - 1) : pref;
                 char buf[96];

@@ -44,6 +44,9 @@ usse_op_type usse_classify(uint64_t e) {
         return cbits(e, 58, 56) ? USSE_T_CJMP : USSE_T_JMP;  /* predicated? */
     }
     unsigned cls = cbits(e, 63, 59);
+    /* lapc: jump to the link register, a return; predicated, a conditional one. */
+    if (cls == 31 && cbits(e, 54, 52) == 0u && cbits(e, 40, 38) == 2u)
+        return cbits(e, 58, 56) ? USSE_T_CRET : USSE_T_RET;
     if (cls == 31) {
         if (cbits(e, 63, 54) == 0x3F0u && cbit(e, 53)) return USSE_T_MOV; /* limm */
         if (e == 0xF800014000000000ull) return USSE_T_NOP;               /* nop  */
@@ -592,6 +595,7 @@ const usse_form usse_forms[] = {
 #undef F_IDX14
 #undef LDST_R
 
+#undef F_LDRFLAGS
     /* ---- the instruction families (forms/) --------------------------------- */
 #define USSE_PART_FORMS
 #include "forms/float.inc"

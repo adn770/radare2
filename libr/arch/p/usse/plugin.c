@@ -226,6 +226,11 @@ static bool usse_decode_cb(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) 
 	case USSE_T_CALL:  op->type = R_ANAL_OP_TYPE_CALL;  break;
 	case USSE_T_NOP:   op->type = R_ANAL_OP_TYPE_NOP;   break;
 	case USSE_T_SYNC:  op->type = R_ANAL_OP_TYPE_SYNC;  break;
+	case USSE_T_RET:   op->type = R_ANAL_OP_TYPE_RET;   break; /* lapc */
+	case USSE_T_CRET:
+		op->type = R_ANAL_OP_TYPE_CRET;
+		op->fail = op->addr + 8;
+		break;
 	default:           op->type = R_ANAL_OP_TYPE_UNK;   break;
 	}
 
