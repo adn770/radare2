@@ -285,3 +285,128 @@ ldad r3, [o58,+#1], drc0
 8,r2,+,[4],r62,=,12,r2,+,[4],r63,=
 EOF
 RUN
+
+NAME=USSE ESIL for SGX register-file accesses (ldr/str)
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 07002020000021fe08006020010021fe04004000000020fe9f420120000029fece1000a000002bfe95090000000028fe4b0020210000a1fe83000020000829fe7fc07f20800021fe850100e0000029fe010100b0000028fe
+e asm.esil=true
+pi 11
+EOF
+EXPECT=<<EOF
+0x10000001c,[4],r1,=
+0x100000020,[4],r3,=
+2,r4,<<,0x100000000,+,[4],r2,=
+r5,0x100000a7c,=[4]
+33,0x100000138,=[4]
+r19,2,r21,<<,0x100000000,+,=[4]
+0x10000012c,[4],r9,=
+r1,0x10000000c,=[4]
+0x10000fffc,[4],pa3,=
+sa3,0x100000014,=[4]
+pa2,2,sa1,<<,0x100000000,+,=[4]
+EOF
+RUN
+
+NAME=USSE ESIL emulates register-file reads and writes in the 4 GiB window
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 07002020000021fe04004000000020fe9f420120000029fe95090000000028fece1000a000002bfe
+o malloc://0x10000 0x100000000
+wv4 0x01150000 @ 0x10000001c
+wv4 0x12345678 @ 0x100000c84
+aei
+aeim
+ar r4=801
+ar r5=0xcafe
+ar r21=0x3a1
+ar r19=0x1234
+aes 5
+ar r1
+ar r2
+pv4 @ 0x100000a7c
+pv4 @ 0x100000e84
+pv4 @ 0x100000138
+EOF
+EXPECT=<<EOF
+0x01150000
+0x12345678
+0x0000cafe
+0x00001234
+0x00000021
+EOF
+RUN
+
+NAME=USSE ESIL for mov repeats between disjoint register ranges
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 000480a00130a1280002202000102128
+e asm.esil=true
+pi 2
+EOF
+EXPECT=<<EOF
+pa8,o4,=,pa9,o5,=,pa10,o6,=,pa11,o7,=
+r4,r1,=,r5,r2,=
+EOF
+RUN
+
+NAME=USSE ESIL emulates mov repeats
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 000480a00130a1280000002600f02128
+aei
+aeim
+ar pa8=0x3f000000
+ar pa9=0xbf000000
+ar pa10=0
+ar pa11=0x3f800000
+ar r0=1
+ar r15=16
+aes 2
+ar o4
+ar o5
+ar o6
+ar o7
+ar r48
+ar r63
+EOF
+EXPECT=<<EOF
+0x3f000000
+0xbf000000
+0x00000000
+0x3f800000
+0x00000001
+0x00000010
+EOF
+RUN
+
+NAME=USSE ESIL leaves register-file, repeat, index and 16-bit forms it cannot pin unmodelled
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 0700c028000021fe05230020000029fe8000402000102128000000a0011021290000e027001021280000c0a301202128800020200030212880042020021009280031c020001003288001202c0310012883c575218412014802c695218c1801488286b6218411014886418180000822a08bc40c2089180948
+e asm.esil=true
+pi 15
+EOF
+EXPECT=<<EOF
+ldr r70, #7, drc0
+str #5, r70
+mov.repeat2 r2, r1
+p0 mov.repeat2 o0, pa0
+mov.repeat2 r63, r0
+mov.repeat3 o30, pa0
+mov.repeat4 r1, r1
+mov i.l, r9
+mov r6, sa[il + #2]
+mov sa[il + #1], r3
+isub16.testtanz.chan0 r11, p1, r11, #3
+isub16.testpat.chan0 r12, p3, r12, #2
+isubu16.testtaz.chan0 r13, p1, r13, #2
+ima16.s r4, r5, #3, r6.neg, u16, u16
+shl.testpat.chan0 !c0, p2, r9, #11
+EOF
+RUN

@@ -40,10 +40,12 @@ static bool reg_ok(const char *r) {
  * subset, op->esil. Conservative: an instruction gets ESIL only when every
  * operand is a profile register or an immediate with modifiers whose meaning is
  * pinned, and every flag is a scheduling flag (skipinv, syncs, nosched, end)
- * that does not change what a single instance computes. Repeats, partial and
- * once-only forms, write masks, half/fixed-point formats, the p sign test and
+ * that does not change what a single instance computes. Repeats (but plain
+ * mov.repeatN between disjoint ranges), partial and once-only forms, write
+ * masks, the index registers, half/fixed-point formats, the p sign test and
  * the multi-channel tests are left without ESIL. Loads/stores follow memop.h,
- * including the fetch forms' extra element and the post-increment writeback.
+ * including the fetch forms' extra element and the post-increment writeback;
+ * ldr/str reach the SGX register file in a window above 4 GiB.
  * Floats are IEEE binary32 held in the 32-bit registers and computed through
  * ESIL's double ops (F2D ... D2F). */
 
@@ -434,6 +436,114 @@ static bool flt_esil(RStrBuf *sb, const char *base, const char *opw, char **args
 	return ok;
 }
 
+/* The SGX register file as ESIL sees it. ldr/str take a dword register
+ * index, from an immediate or a register: register offset = index * 4 (the
+ * hardware returns CORE_ID for "ldr rD, #7" and the firmware programs its
+ * registers this way). The registers are not in the USSE's 32-bit address
+ * space, so the emulation places them in a window just above it, at
+ * USSE_CR_ESIL_BASE + index * 4; map memory there ("o malloc://0x10000
+ * 0x100000000") to emulate them. The window is plain memory: registers with
+ * side effects (status, clear-on-read) and the drc wait of ldr are not
+ * modelled, and register-supplied indexes are not masked to 14 bits. */
+#define USSE_CR_ESIL_BASE 0x100000000ULL
+
+static bool cr_index(RStrBuf *sb, const char *t) {
+	if (*t == '#') {
+		char *end = NULL;
+		const ut64 idx = strtoull (t + 1, &end, 0);
+		if (end == t + 1 || *end || idx > 0x3fff) {
+			return false;
+		}
+		r_strbuf_appendf (sb, "0x%"PFMT64x, USSE_CR_ESIL_BASE + idx * 4);
+		return true;
+	}
+	if (!simple_tok (t)) {
+		return false;
+	}
+	r_strbuf_appendf (sb, "2,%s,<<,0x%"PFMT64x",+", t, USSE_CR_ESIL_BASE);
+	return true;
+}
+
+/* "ldr rD, idx, drcN" and "str idx, src" (src a register or an immediate). */
+static bool cr_esil(RStrBuf *sb, const char *base, const char *opw, char **args, int argc) {
+	bool nowrite;
+	if (!flags_ok (opw, NULL, NULL, NULL)) {
+		return false;
+	}
+	if (!strcmp (base, "ldr")) {
+		if (argc != 3 || strncmp (args[2], "drc", 3) || !dst_ok (args[0], &nowrite) || nowrite
+				|| !cr_index (sb, args[1])) {
+			return false;
+		}
+		r_strbuf_appendf (sb, ",[4],%s,=", args[0]);
+		return true;
+	}
+	if (argc != 2 || !simple_tok (args[1])) {
+		return false;
+	}
+	r_strbuf_appendf (sb, "%s,", esil_tok (args[1]));
+	return cr_index (sb, args[0]) && r_strbuf_append (sb, ",=[4]");
+}
+
+/* Split a profile register into its bank and number ("pa12" -> "pa", 12). */
+static bool reg_split(const char *t, char *bank, size_t bn, int *num) {
+	const char *p = t;
+	while (*p >= 'a' && *p <= 'z') {
+		p++;
+	}
+	if (p == t || (size_t) (p - t) >= bn || *p < '0' || *p > '9') {
+		return false;
+	}
+	memcpy (bank, t, p - t);
+	bank[p - t] = 0;
+	*num = atoi (p);
+	return true;
+}
+
+/* mov.repeatN d, s: N moves d+i = s+i, the task's starting increments (one
+ * register per iteration), as our vertex and state-copy programs use them on
+ * the hardware ("mov.skipinv.repeat4 o0, pa0" copies the position to o0-o3).
+ * Only between register ranges that do not overlap, so the order of the
+ * iterations does not matter, every register is in the profile, and without
+ * a predicate (per-iteration predicates are not pinned). The increments that
+ * smlsi/smoa/smbo set are not tracked. */
+static bool mov_repeat_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
+	static const char * const rep[] = { "repeat2", "repeat3", "repeat4", "repeat5", "repeat6",
+		"repeat7", "repeat8", "repeat9", "repeat10", "repeat11", "repeat12", "repeat13",
+		"repeat14", "repeat15", "repeat16", NULL };
+	char db[8], sbk[8], reg[24];
+	int d, s, n = 0, i;
+	if (argc != 2 || !flags_ok (opw, rep, NULL, NULL)) {
+		return false;
+	}
+	for (i = 0; rep[i]; i++) {
+		if (has_flag (opw, rep[i])) {
+			n = i + 2;
+		}
+	}
+	if (!n || !simple_tok (args[0]) || !simple_tok (args[1]) || *args[0] == '#' || *args[1] == '#'
+			|| !reg_split (args[0], db, sizeof db, &d) || !reg_split (args[1], sbk, sizeof sbk, &s)) {
+		return false;
+	}
+	if (!strcmp (db, sbk) && d < s + n && s < d + n) {
+		return false;
+	}
+	for (i = 0; i < n; i++) {
+		snprintf (reg, sizeof reg, "%s%d", db, d + i);
+		if (!reg_ok (reg)) {
+			return false;
+		}
+		snprintf (reg, sizeof reg, "%s%d", sbk, s + i);
+		if (!reg_ok (reg)) {
+			return false;
+		}
+	}
+	for (i = 0; i < n; i++) {
+		r_strbuf_appendf (sb, "%s%s%d,%s%d,=", i ? "," : "", sbk, s + i, db, d + i);
+	}
+	return true;
+}
+
 /* ESIL for a load/store whose addresses are fully known (memop.h). */
 static bool mem_esil(const UsseMemOp *m, RStrBuf *sb) {
 	if (!usse_memop_modelled (m) || (m->load && *m->data == '#')) {
@@ -543,8 +653,11 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 	/* op->direction for memory ops */
 	if (!strcmp (base, "ldad") || !strcmp (base, "ldaw")) {
 		op->direction = R_ANAL_OP_DIR_READ;
-	} else if (!strcmp (base, "stad") || !strcmp (base, "staw")) {
+	} else if (!strcmp (base, "stad") || !strcmp (base, "staw") || !strcmp (base, "str")) {
 		op->direction = R_ANAL_OP_DIR_WRITE;
+	}
+	if (!strcmp (base, "ldr")) {
+		op->direction = R_ANAL_OP_DIR_READ;
 	}
 
 	if (!(mask & R_ARCH_OP_MASK_ESIL)) {
@@ -595,6 +708,10 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 			ok = imul_esil (ab, base, opw, args, argc);
 		} else if (*base == 'f') {
 			ok = flt_esil (ab, base, opw, args, argc);
+		} else if (!strcmp (base, "ldr") || !strcmp (base, "str")) {
+			ok = cr_esil (ab, base, opw, args, argc);
+		} else if (!strcmp (base, "mov") && !cond[0]) {
+			ok = mov_repeat_esil (ab, opw, args, argc);
 		}
 		if (!ok) {
 			r_strbuf_free (ab);
