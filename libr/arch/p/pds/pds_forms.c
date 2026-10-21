@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Josep Torra
 /* pds_forms.c — the PDS instruction forms the assembler matches text against.
  *
  * The PDS decoder (tools/usse-dis/pds.c) is a compact field decoder rather

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Josep Torra
 /* usse_form.c — decode and encode USSE words with the form table (see
  * usse_form.h). Generic kinds (enumerations and numbers) live here; the
  * USSE-specific operand kinds live with the table in usse.c. */

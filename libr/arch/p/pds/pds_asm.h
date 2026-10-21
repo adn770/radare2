@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 Josep Torra */
 /* pds_asm.h — encode one PDS instruction (see pds_forms.c). */
 #ifndef PDS_ASM_H
 #define PDS_ASM_H

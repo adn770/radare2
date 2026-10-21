@@ -1,13 +1,17 @@
-/* usse.h — SGX Series-5 USSE instruction decoder (narrow v1: ukernel subset).
+/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 Josep Torra */
+/* usse.h — SGX Series-5 USSE instruction decoder: the whole SGX545 instruction
+ * set, with the SGX540 readings where they differ (usse_set_core()).
  *
  * The USSE instruction word is 64-bit little-endian. The top 5 bits (enc[63:59])
  * select the major opcode class; class 0x1F (0xF8..0xFF) is the control/special
- * group with further sub-opcode bits. All field layouts in usse.c are derived by
- * bit-correlation against the SGX540 ground-truth disassembly (see
- * tools/usse-dis/README.md and debug/usse/solve_bits.py), not guessed.
+ * group with further sub-opcode bits. The field layouts (the form tables in
+ * usse.c and forms/) were derived by bit-correlation against the SGX540
+ * ground-truth disassembly (solve.py) and by black-box probing of the SGX545
+ * reference disassembler (see tools/usse-dis/README.md), not guessed.
  *
  * This core is standalone (no radare2 dependency) so it can be regression-tested
- * against the oracle via the usse-dis CLI, then wrapped as an r2 RArch plugin. */
+ * against the oracle via the usse-dis CLI; r2/ wraps it as an r2 RArch plugin. */
 #ifndef USSE_H
 #define USSE_H
 #include <stdint.h>

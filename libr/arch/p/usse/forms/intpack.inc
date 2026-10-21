@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 Josep Torra */
 /* forms/intpack.inc — the intpack family of USSE forms, included twice by usse.c:
  * with USSE_PART_DEFS for this family's operand kinds and field macros (name
  * them with a family prefix), and with USSE_PART_FORMS for its table entries.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Josep Torra
 /* pds.c — SGX Series-5 PDS instruction decoder (see pds.h).
  *
  * Word layout: opcode = w[31:27], predicate = w[26:24] (7 = always), and a 24-bit

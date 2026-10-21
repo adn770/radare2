@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Josep Torra
 /* usse.c — SGX Series-5 USSE decoder core: the instruction-form table that
  * usse_decode() walks and the assembler (tools/usse-asm) inverts (see
  * usse_form.h). Field layouts were derived from the SGX540 oracle disassembly

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 Josep Torra */
 /* usse_form.h — the USSE instruction-form table, shared by the decoder
  * (usse.c, usse-dis) and the assembler (tools/usse-asm).
  *

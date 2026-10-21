@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 Josep Torra */
 /* forms/memctl.inc — the memctl family of USSE forms, included twice by usse.c:
  * with USSE_PART_DEFS for this family's operand kinds and field macros (name
  * them with a family prefix), and with USSE_PART_FORMS for its table entries.
@@ -281,24 +283,35 @@ ENUM(MEM_CFLEVEL, 4, "0 /* Reserved */", "1 /* L0 and L1 */", "2 /* L2 */",
 #undef MEM_LDRFLAGS
 #undef MEM_LDSTR
 #define MEM_EMIT(m, v) MEM_OTH(3, M(47, 46) | (m), v)
+/* The closed compilers' vertex and state programs write the operand an emit does
+ * not print as immediate 0 (bank 2 with the extension bit): src1 of emitvcbst and
+ * emitvcbvtx, the extension bit of src0 for emitmtest (the 3D captures,
+ * design/sgx545_3d.md 9.2). The encoder prefers that. */
+#define EMIT_UNUSED_SRC1 (B(49) | B(31))
+#define EMIT_UNUSED_SRC0 B(51)
     { "emitpds{0}{1}{2}{3}{4} #{5} /* incp */, {6}, {7}, {8}, #{9}", MEM_EMIT(0, B(47)),
       { FLD(F_NOSCHED, C(43, 1)), FLD(F_END, C(50, 1)), FLD(MEM_F_TASKS, C(45, 1)),
         FLD(MEM_F_TASKE, C(44, 1)), FLD(F_FREEP, C(21, 1)), FLD(K_DEC, C(32, 2), C(41, 1)),
         F_SRC0, F_SRC1D, F_SRC2D, FLD(K_HEX, C(22, 6), C(35, 6), C(54, 2)) } },
     { "emitmtest{0}{1}{2}{3} #{4} /* incp */, {5}, {6}", MEM_EMIT(B(44), B(46)),
       { FLD(F_NOSCHED, C(43, 1)), FLD(F_END, C(50, 1)), FLD(MEM_F_THREEPART, C(42, 1)),
-        FLD(F_FREEP, C(21, 1)), FLD(K_DEC, C(32, 2), C(41, 1)), F_SRC1D, F_SRC2D } },
+        FLD(F_FREEP, C(21, 1)), FLD(K_DEC, C(32, 2), C(41, 1)), F_SRC1D, F_SRC2D },
+      EMIT_UNUSED_SRC0 },
     { "emitmtevtx{0}{1}{2}{3}{4} #{5} /* incp */, {6}, {7}", MEM_EMIT(B(44), B(46) | B(44)),
       { FLD(F_NOSCHED, C(43, 1)), FLD(F_END, C(50, 1)), FLD(MEM_F_TWOPART, C(42, 1)),
         FLD(MEM_F_CUT, C(45, 1)), FLD(F_FREEP, C(21, 1)), FLD(K_DEC, C(32, 2), C(41, 1)),
         F_SRC1D, F_SRC2D } },
     { "emitvcbst{0}{1}{2}{3} #{4} /* incp */, {5}", MEM_EMIT(B(44), B(47) | B(46)),
       { FLD(F_NOSCHED, C(43, 1)), FLD(F_END, C(50, 1)), FLD(MEM_F_THREEPART, C(42, 1)),
-        FLD(F_FREEP, C(21, 1)), FLD(K_DEC, C(32, 2), C(41, 1)), F_SRC2D } },
+        FLD(F_FREEP, C(21, 1)), FLD(K_DEC, C(32, 2), C(41, 1)), F_SRC2D },
+      EMIT_UNUSED_SRC1 },
     { "emitvcbvtx{0}{1}{2}{3} #{4} /* incp */, {5}", MEM_EMIT(B(44), B(47) | B(46) | B(44)),
       { FLD(F_NOSCHED, C(43, 1)), FLD(F_END, C(50, 1)), FLD(MEM_F_TWOPART, C(42, 1)),
-        FLD(F_FREEP, C(21, 1)), FLD(K_DEC, C(32, 2), C(41, 1)), F_SRC2D } },
+        FLD(F_FREEP, C(21, 1)), FLD(K_DEC, C(32, 2), C(41, 1)), F_SRC2D },
+      EMIT_UNUSED_SRC1 },
 #undef MEM_EMIT
+#undef EMIT_UNUSED_SRC1
+#undef EMIT_UNUSED_SRC0
 #undef MEM_OTH
 
     /* ---- class 31 visibility test group (enc[53:52] = 3) ------------------- *

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 Josep Torra */
 /* pds.h — SGX Series-5 PDS (Programmable Data Sequencer) instruction decoder.
  *
  * A PDS program is a data segment (constants, in two banks ds0/ds1) followed by
