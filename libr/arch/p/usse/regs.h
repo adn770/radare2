@@ -247,3 +247,5 @@
 "gpr\tp1\t.32\t980\t0\n"
 "gpr\tp2\t.32\t984\t0\n"
 "gpr\tp3\t.32\t988\t0\n"
+"gpr\til\t.32\t992\t0\n"
+"gpr\tih\t.32\t996\t0\n"

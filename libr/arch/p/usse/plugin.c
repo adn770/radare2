@@ -209,8 +209,11 @@ static void src_int(RStrBuf *sb, const UsseSrc *s) {
 }
 
 /* 32-bit result of a two-source integer op (bitwise group, test group adds),
- * or false when its semantics are not pinned for these operands. Shift and
- * rotate amounts must be immediates below 32; only src2 may be inverted. */
+ * or false when its semantics are not pinned for these operands; only src2
+ * may be inverted. Measured on the hardware (tools/usse-asm/probe.py):
+ * iadd32/iaddu32 add src1's low half, sign- or zero-extended, to the 32-bit
+ * src2; shl/shr by a register amount of 32 and over give 0, asr fills the
+ * sign and rol takes the amount mod 32. Immediate amounts stay below 32. */
 static bool alu_val(RStrBuf *sb, const char *op, const UsseSrc *a, const UsseSrc *b) {
 	if (a->inv || a->neg || a->abs || a->low || a->high || b->neg || b->abs || b->low || b->high) {
 		return false;
@@ -222,13 +225,43 @@ static bool alu_val(RStrBuf *sb, const char *op, const UsseSrc *a, const UsseSrc
 		return true;
 	}
 	if (!strcmp (op, "iadd32") || !strcmp (op, "iaddu32")) {
+		const bool sx = op[4] == '3';
 		if (b->inv) {
 			return false;
 		}
-		r_strbuf_appendf (sb, "%s,%s,+,0xffffffff,&", b->tok, a->tok);
+		if (a->imm) {
+			ut32 v = (ut32) a->val & 0xffff;
+			if (sx && (v & 0x8000)) {
+				v |= 0xffff0000;
+			}
+			r_strbuf_appendf (sb, v > 0xffff ? "%s,0x%x,+,0xffffffff,&" : "%s,%u,+,0xffffffff,&",
+				b->tok, v);
+		} else {
+			r_strbuf_appendf (sb, "%s,%s%s,0xffff,&%s,+,0xffffffff,&", b->tok,
+				sx ? "16," : "", a->tok, sx ? ",~" : "");
+		}
 		return true;
 	}
-	if (b->inv || !b->imm || b->val > 31) {
+	if (b->inv) {
+		return false;
+	}
+	if (!b->imm) {
+		/* a register amount: any 32-bit value */
+		const char *x = a->tok, *y = b->tok;
+		if (!strcmp (op, "shl")) {
+			r_strbuf_appendf (sb, "0xffffffe0,%s,&,!,31,%s,&,%s,<<,0xffffffff,&,*", y, y, x);
+		} else if (!strcmp (op, "shr")) {
+			r_strbuf_appendf (sb, "0xffffffe0,%s,&,!,31,%s,&,%s,>>,*", y, y, x);
+		} else if (!strcmp (op, "rol")) {
+			r_strbuf_appendf (sb, "31,%s,&,%s,<<,31,%s,&,32,-,%s,>>,|,0xffffffff,&", y, x, y, x);
+		} else if (!strcmp (op, "asr")) {
+			r_strbuf_appendf (sb, "0xffffffe0,%s,&,!,!,31,*,31,%s,&,|,%s,ASR,0xffffffff,&", y, y, x);
+		} else {
+			return false;
+		}
+		return true;
+	}
+	if (b->val > 31) {
 		return false;
 	}
 	const unsigned n = (unsigned) b->val;
@@ -251,41 +284,75 @@ static bool alu_val(RStrBuf *sb, const char *op, const UsseSrc *a, const UsseSrc
 	return true;
 }
 
+/* One 16-bit lane of a source: an immediate is in both lanes, a register
+ * gives its low or high half. */
+static void src_lane(RStrBuf *sb, const UsseSrc *s, bool high) {
+	if (s->imm) {
+		r_strbuf_appendf (sb, "0x%"PFMT64x, s->val & 0xffff);
+	} else if (high) {
+		r_strbuf_appendf (sb, "16,%s,>>", s->tok);
+	} else {
+		r_strbuf_appendf (sb, "%s,0xffff,&", s->tok);
+	}
+}
+
+/* isub16/isubu16: both 16-bit lanes a - b, wrapping (measured: no
+ * saturation, an immediate subtracted from both lanes). */
+static bool lane_sub(RStrBuf *sb, const UsseSrc *a, const UsseSrc *b) {
+	if (!src_plain (a) || !src_plain (b) || a->imm) {
+		return false;
+	}
+	int h;
+	for (h = 0; h < 2; h++) {
+		if (h) {
+			r_strbuf_append (sb, ",");
+		}
+		src_lane (sb, b, h);
+		r_strbuf_append (sb, ",");
+		src_lane (sb, a, h);
+		r_strbuf_append (sb, h ? ",-,0xffff,&,0x10000,*,|" : ",-,0xffff,&");
+	}
+	return true;
+}
+
 /* Test group: "<op>.test<S><a|o><Z>.chan0 dst, pN, src1, src2" computes the
- * 32-bit result, sets pN from it and writes dst unless it is "!reg". The sign
- * test S is t (none) or n (bit 31: the firmware tests bits by shifting them to
- * the top, "shl.testnat #25"); Z is t, z or nz; a/o join them. Not modelled:
- * the p sign test (positive: > 0 or >= 0 is not pinned), a/o with a t side
- * (whether t is "true" or "not tested" matters there), sign tests of the adds,
- * channels other than chan0 and every 8/16-bit and float operation. */
+ * result, sets pN from it and writes dst unless it is "!reg". As measured on
+ * the hardware: the sign test S is t (true), n (the sign bit) or p (its
+ * complement, >= 0); Z is t (true), z or nz; a/o join them, so an o join with
+ * a t side is always true. The bitwise group, the shifts and iadd32 test the
+ * 32-bit result; iaddu32 is unsigned (n never, p always true); isub16 and
+ * isubu16 test their low lane (chan0), and isubu16's sign tests are not
+ * modelled. Other channels (measured to clear pN for z) and the 8-bit and
+ * float tests are not modelled. */
 static bool test_esil(RStrBuf *sb, const char *base, const char *opw, char **args, int argc) {
-	static const char * const sign_ops[] = { "and", "or", "xor", "shl", "shr", "rol", "asr", NULL };
+	static const char * const ops[] = { "and", "or", "xor", "shl", "shr", "rol", "asr",
+		"iadd32", "iaddu32", "isub16", "isubu16", NULL };
 	char test[12], chan[12];
-	bool nowrite, signok = false;
+	bool nowrite, known = false;
 	UsseSrc a, b;
 	int i;
 	if (argc != 4 || !flags_ok (opw, NULL, test, chan) || !*test || strcmp (chan, "chan0")) {
 		return false;
 	}
-	for (i = 0; sign_ops[i]; i++) {
-		signok |= !strcmp (base, sign_ops[i]);
+	for (i = 0; ops[i]; i++) {
+		known |= !strcmp (base, ops[i]);
 	}
-	if (!signok && strcmp (base, "iadd32") && strcmp (base, "iaddu32")) {
+	if (!known) {
 		return false;
 	}
+	const bool lanes = !strncmp (base, "isub", 4), uns = !strcmp (base, "iaddu32");
 	/* test<S><a|o><Z> */
 	const char *t = test + 4;
 	const char sgn = *t++;
 	const char join = *t++;
 	const char *zero = t;
-	if ((sgn != 't' && sgn != 'n') || (join != 'a' && join != 'o')) {
+	if ((sgn != 't' && sgn != 'n' && sgn != 'p') || (join != 'a' && join != 'o')) {
 		return false;
 	}
 	if (strcmp (zero, "t") && strcmp (zero, "z") && strcmp (zero, "nz")) {
 		return false;
 	}
-	const bool st = sgn == 't', zt = !strcmp (zero, "t");
-	if ((st && zt) || (join == 'o' && (st || zt)) || (!st && !signok)) {
+	if (!strcmp (base, "isubu16") && sgn != 't') {
 		return false;
 	}
 	if (!dst_ok (args[0], &nowrite) || strlen (args[1]) != 2 || args[1][0] != 'p'
@@ -296,24 +363,41 @@ static bool test_esil(RStrBuf *sb, const char *base, const char *opw, char **arg
 		return false;
 	}
 	RStrBuf *v = r_strbuf_new ("");
-	if (!alu_val (v, base, &a, &b)) {
+	if (!(lanes ? lane_sub (v, &a, &b) : alu_val (v, base, &a, &b))) {
 		r_strbuf_free (v);
 		return false;
 	}
 	const char *val = r_strbuf_get (v);
-	if (!st) {
-		r_strbuf_appendf (sb, "31,%s,>>", val);
+	/* the tested value: the result, or the low lane of a 16-bit op */
+	char *tv = lanes ? r_str_newf ("%s,0xffff,&", val) : strdup (val);
+	const int top = lanes ? 15 : 31;
+	char *sx = NULL, *zx = NULL;      /* NULL: true */
+	if (sgn == 'n') {
+		sx = uns ? strdup ("0") : r_str_newf ("%d,%s,>>", top, tv);
+	} else if (sgn == 'p' && !uns) {
+		sx = r_str_newf ("%d,%s,>>,!", top, tv);
 	}
-	if (!zt) {
-		r_strbuf_appendf (sb, "%s%s,!%s", st ? "" : ",", val, strcmp (zero, "z") ? ",!" : "");
+	if (!strcmp (zero, "z")) {
+		zx = r_str_newf ("%s,!", tv);
+	} else if (!strcmp (zero, "nz")) {
+		zx = r_str_newf ("%s,!,!", tv);
 	}
-	if (!st && !zt) {
-		r_strbuf_append (sb, join == 'a' ? ",&" : ",|");
+	if (join == 'o' && (!sx || !zx)) {
+		r_strbuf_append (sb, "1");
+	} else if (!sx && !zx) {
+		r_strbuf_append (sb, "1");
+	} else if (!sx || !zx) {
+		r_strbuf_append (sb, sx ? sx : zx);
+	} else {
+		r_strbuf_appendf (sb, "%s,%s,%s", sx, zx, join == 'a' ? "&" : "|");
 	}
 	r_strbuf_appendf (sb, ",%s,=", args[1]);
 	if (!nowrite) {
 		r_strbuf_appendf (sb, ",%s,%s,=", val, args[0]);
 	}
+	free (sx);
+	free (zx);
+	free (tv);
 	r_strbuf_free (v);
 	return true;
 }
@@ -385,6 +469,48 @@ static bool imul_esil(RStrBuf *sb, const char *base, const char *opw, char **arg
 	return true;
 }
 
+/* ima16.{s,u} d, a, b, c[.neg], u16, u16: in each 16-bit lane a * b + c (or
+ * - c), wrapping; an immediate b or c is in both lanes (measured; the low 16
+ * bits of the product are the same signed or unsigned). The other formats
+ * are not modelled. */
+static bool ima16_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
+	static const char * const us[] = { "u", NULL };
+	static const char * const ss[] = { "s", NULL };
+	const bool sign = has_flag (opw, "s");
+	bool nowrite;
+	UsseSrc a, b, c;
+	int h;
+	if (argc != 6 || strcmp (args[4], "u16") || strcmp (args[5], "u16")
+			|| sign == has_flag (opw, "u") || !flags_ok (opw, sign ? ss : us, NULL, NULL)) {
+		return false;
+	}
+	if (!dst_ok (args[0], &nowrite) || nowrite || !src_parse (args[1], &a)
+			|| !src_parse (args[2], &b) || !src_parse (args[3], &c)) {
+		return false;
+	}
+	if (!src_plain (&a) || a.imm || !src_plain (&b) || c.inv || c.abs || c.low || c.high) {
+		return false;
+	}
+	for (h = 0; h < 2; h++) {
+		if (h) {
+			r_strbuf_append (sb, ",");
+		}
+		src_lane (sb, &c, h);
+		r_strbuf_append (sb, ",");
+		src_lane (sb, &b, h);
+		r_strbuf_append (sb, ",");
+		src_lane (sb, &a, h);
+		r_strbuf_appendf (sb, ",*,%s,0xffff,&%s", c.neg ? "-" : "+", h ? ",0x10000,*,|" : "");
+	}
+	r_strbuf_appendf (sb, ",%s,=", args[0]);
+	return true;
+}
+
+/* Flush a binary32 on the stack to zero when it is a denormal, keeping its
+ * sign: the hardware does so with fmad's inputs, product and result and with
+ * frcp's input (measured). */
+#define FLT_FLUSH "DUP,0x7f800000,&,!,!,0x7fffffff,*,0x80000000,|,&"
+
 /* A float source as a double on the ESIL stack; .abs and .neg act on the sign
  * bit (.neg.abs is -|x|). Float immediates are not modelled. */
 static bool src_flt(RStrBuf *sb, const char *t) {
@@ -393,22 +519,26 @@ static bool src_flt(RStrBuf *sb, const char *t) {
 		return false;
 	}
 	if (s.neg && s.abs) {
-		r_strbuf_appendf (sb, "32,0x80000000,%s,|,F2D", s.tok);
+		r_strbuf_appendf (sb, "32,0x80000000,%s,|", s.tok);
 	} else if (s.neg) {
-		r_strbuf_appendf (sb, "32,0x80000000,%s,^,F2D", s.tok);
+		r_strbuf_appendf (sb, "32,0x80000000,%s,^", s.tok);
 	} else if (s.abs) {
-		r_strbuf_appendf (sb, "32,0x7fffffff,%s,&,F2D", s.tok);
+		r_strbuf_appendf (sb, "32,0x7fffffff,%s,&", s.tok);
 	} else {
-		r_strbuf_appendf (sb, "32,%s,F2D", s.tok);
+		r_strbuf_appendf (sb, "32,%s", s.tok);
 	}
+	r_strbuf_append (sb, ","FLT_FLUSH",F2D");
 	return true;
 }
 
-/* fmad d, a, b, c (a * b + c), frcp, frsq and fsqrt, in IEEE binary32 through
- * ESIL's doubles. Not modelled: repeats and source increments other than
- * incs000, .tpres, write masks, f16/fixed-point sources (.flt16, .c10, swizzles),
- * immediates, fexp/flog/fsin/fcos (no ESIL op), the dual-issue and the test
- * group forms. */
+/* fmad d, a, b, c, frcp, frsq and fsqrt, in IEEE binary32 through ESIL's
+ * doubles. As measured: fmad rounds the product to binary32, then the sum,
+ * both to nearest even (not fused), and flushes denormal inputs, product and
+ * result to zero; frcp/frsq/fsqrt are within one ulp of the correctly rounded
+ * result the ESIL computes. Not modelled: repeats and source increments other
+ * than incs000, .tpres, write masks, f16/fixed-point sources (.flt16, .c10,
+ * swizzles), immediates, fexp/flog/fsin/fcos (no ESIL op), the dual-issue and
+ * the test group forms. */
 static bool flt_esil(RStrBuf *sb, const char *base, const char *opw, char **args, int argc) {
 	static const char * const incs[] = { "incs000", NULL };
 	bool nowrite;
@@ -418,10 +548,11 @@ static bool flt_esil(RStrBuf *sb, const char *base, const char *opw, char **args
 	RStrBuf *t = r_strbuf_new ("32,");
 	bool ok = false;
 	if (!strcmp (base, "fmad")) {
+		/* sum = round(round(a * b) + c): two binary32 roundings */
 		ok = argc == 4 && flags_ok (opw, incs, NULL, NULL) && src_flt (t, args[3])
-			&& r_strbuf_append (t, ",") && src_flt (t, args[2])
+			&& r_strbuf_append (t, ",32,32,") && src_flt (t, args[2])
 			&& r_strbuf_append (t, ",") && src_flt (t, args[1])
-			&& r_strbuf_append (t, ",F*,F+");
+			&& r_strbuf_append (t, ",F*,D2F,"FLT_FLUSH",F2D,F+");
 	} else if (!strcmp (base, "frcp") || !strcmp (base, "frsq") || !strcmp (base, "fsqrt")) {
 		ok = argc == 2 && flags_ok (opw, NULL, NULL, NULL) && src_flt (t, args[1]);
 		if (ok) {
@@ -430,7 +561,8 @@ static bool flt_esil(RStrBuf *sb, const char *base, const char *opw, char **args
 		}
 	}
 	if (ok) {
-		r_strbuf_appendf (sb, "%s,D2F,%s,=", r_strbuf_get (t), args[0]);
+		r_strbuf_appendf (sb, "%s,D2F,%s%s,=", r_strbuf_get (t),
+			strcmp (base, "fmad") ? "" : FLT_FLUSH",", args[0]);
 	}
 	r_strbuf_free (t);
 	return ok;
@@ -444,10 +576,11 @@ static bool flt_esil(RStrBuf *sb, const char *base, const char *opw, char **args
  * USSE_CR_ESIL_BASE + index * 4; map memory there ("o malloc://0x10000
  * 0x100000000") to emulate them. The window is plain memory: registers with
  * side effects (status, clear-on-read) and the drc wait of ldr are not
- * modelled, and register-supplied indexes are not masked to 14 bits. */
+ * modelled. ldr masks a register index to 14 bits (measured: 0x4007,
+ * 0x10007 and 0x40007 read CORE_ID); str's register index is not masked. */
 #define USSE_CR_ESIL_BASE 0x100000000ULL
 
-static bool cr_index(RStrBuf *sb, const char *t) {
+static bool cr_index(RStrBuf *sb, const char *t, bool mask) {
 	if (*t == '#') {
 		char *end = NULL;
 		const ut64 idx = strtoull (t + 1, &end, 0);
@@ -460,7 +593,11 @@ static bool cr_index(RStrBuf *sb, const char *t) {
 	if (!simple_tok (t)) {
 		return false;
 	}
-	r_strbuf_appendf (sb, "2,%s,<<,0x%"PFMT64x",+", t, USSE_CR_ESIL_BASE);
+	if (mask) {
+		r_strbuf_appendf (sb, "2,0x3fff,%s,&,<<,0x%"PFMT64x",+", t, USSE_CR_ESIL_BASE);
+	} else {
+		r_strbuf_appendf (sb, "2,%s,<<,0x%"PFMT64x",+", t, USSE_CR_ESIL_BASE);
+	}
 	return true;
 }
 
@@ -472,7 +609,7 @@ static bool cr_esil(RStrBuf *sb, const char *base, const char *opw, char **args,
 	}
 	if (!strcmp (base, "ldr")) {
 		if (argc != 3 || strncmp (args[2], "drc", 3) || !dst_ok (args[0], &nowrite) || nowrite
-				|| !cr_index (sb, args[1])) {
+				|| !cr_index (sb, args[1], true)) {
 			return false;
 		}
 		r_strbuf_appendf (sb, ",[4],%s,=", args[0]);
@@ -482,7 +619,7 @@ static bool cr_esil(RStrBuf *sb, const char *base, const char *opw, char **args,
 		return false;
 	}
 	r_strbuf_appendf (sb, "%s,", esil_tok (args[1]));
-	return cr_index (sb, args[0]) && r_strbuf_append (sb, ",=[4]");
+	return cr_index (sb, args[0], false) && r_strbuf_append (sb, ",=[4]");
 }
 
 /* Split a profile register into its bank and number ("pa12" -> "pa", 12). */
@@ -503,10 +640,12 @@ static bool reg_split(const char *t, char *bank, size_t bn, int *num) {
 /* mov.repeatN d, s: N moves d+i = s+i, the task's starting increments (one
  * register per iteration), as our vertex and state-copy programs use them on
  * the hardware ("mov.skipinv.repeat4 o0, pa0" copies the position to o0-o3).
- * Only between register ranges that do not overlap, so the order of the
- * iterations does not matter, every register is in the profile, and without
- * a predicate (per-iteration predicates are not pinned). The increments that
- * smlsi/smoa/smbo set are not tracked. */
+ * Measured: the iterations run one after the other in ascending order, so
+ * overlapping ranges propagate ("mov.repeat3 r2, r1" copies r1 to r2-r4), and
+ * a predicate is tested once for the whole instruction. Every register must
+ * be in the profile. The increments that smlsi/smoa/smbo set are not tracked
+ * (measured: smlsi's first increment is the destination's, its third the
+ * source's). */
 static bool mov_repeat_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
 	static const char * const rep[] = { "repeat2", "repeat3", "repeat4", "repeat5", "repeat6",
 		"repeat7", "repeat8", "repeat9", "repeat10", "repeat11", "repeat12", "repeat13",
@@ -525,9 +664,6 @@ static bool mov_repeat_esil(RStrBuf *sb, const char *opw, char **args, int argc)
 			|| !reg_split (args[0], db, sizeof db, &d) || !reg_split (args[1], sbk, sizeof sbk, &s)) {
 		return false;
 	}
-	if (!strcmp (db, sbk) && d < s + n && s < d + n) {
-		return false;
-	}
 	for (i = 0; i < n; i++) {
 		snprintf (reg, sizeof reg, "%s%d", db, d + i);
 		if (!reg_ok (reg)) {
@@ -540,6 +676,99 @@ static bool mov_repeat_esil(RStrBuf *sb, const char *opw, char **args, int argc)
 	}
 	for (i = 0; i < n; i++) {
 		r_strbuf_appendf (sb, "%s%s%d,%s%d,=", i ? "," : "", sbk, s + i, db, d + i);
+	}
+	return true;
+}
+
+/* Moves through the index register: "mov i.l, src" and "mov d, B[il + #n]" /
+ * "mov B[il + #n], s" for the banks r and sa. Measured: the register is
+ * B(i.l + n), counted from the bank's first register; bits 10 and up of i.l
+ * are ignored. ESIL cannot name a register from a value, so the move is a
+ * chain of conditionals over the bank's registers in the profile (r0-r63,
+ * sa0-sa31); an index outside them moves nothing. i.h, the o and pa banks
+ * and other operations' indexed operands are not modelled. */
+static bool idx_parse(const char *t, char *bank, size_t bn, int *n, int *max) {
+	const char *br = strchr (t, '[');
+	char *end = NULL;
+	if (!br || (size_t) (br - t) >= bn || strncmp (br, "[il + #", 7)) {
+		return false;
+	}
+	memcpy (bank, t, br - t);
+	bank[br - t] = 0;
+	*max = !strcmp (bank, "r") ? 64 : !strcmp (bank, "sa") ? 32 : 0;
+	*n = (int) strtol (br + 7, &end, 10);
+	return *max && end && end != br + 7 && !strcmp (end, "]");
+}
+
+static bool idx_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
+	char bank[8], reg[24];
+	int n, max, k;
+	bool nowrite;
+	if (argc != 2 || !flags_ok (opw, NULL, NULL, NULL)) {
+		return false;
+	}
+	if (!strcmp (args[0], "i.l")) {
+		if (!simple_tok (args[1])) {
+			return false;
+		}
+		r_strbuf_appendf (sb, "%s,il,=", esil_tok (args[1]));
+		return true;
+	}
+	const bool load = idx_parse (args[1], bank, sizeof bank, &n, &max);
+	if (load) {
+		if (!dst_ok (args[0], &nowrite) || nowrite) {
+			return false;
+		}
+	} else if (!idx_parse (args[0], bank, sizeof bank, &n, &max) || !simple_tok (args[1])) {
+		return false;
+	}
+	for (k = n; k < max; k++) {
+		snprintf (reg, sizeof reg, "%s%d", bank, k);
+		r_strbuf_appendf (sb, "%s%d,il,0x3ff,&,-,!,?{,%s,%s,=,}", k > n ? "," : "", k - n,
+			load ? reg : esil_tok (args[1]), load ? args[0] : reg);
+	}
+	return true;
+}
+
+/* A load or store with a register offset: "ldad d, [b,+o]", "ldad d, [b,-o]",
+ * "ldad.fetchN d, [b,+o]" and "stad [b,+o], s" (dwords). Measured: the offset
+ * register holds two unsigned 16-bit halves whose product is the offset in
+ * bytes (the firmware ORs 0x00040000 into a dword index), added to the base
+ * modulo 2^32; a fetch starts one element after it, as with immediates; a
+ * load from an address that is not a multiple of 4 reads those four bytes,
+ * a store to one does not land. Word forms, pre/post increments and the
+ * negative fetch are not modelled. */
+static bool mem_reg_esil(const UsseMemOp *m, RStrBuf *sb) {
+	const int n = m->fetch ? m->fetch : 1;
+	char reg[24], addr[96];
+	int i;
+	if (m->imm || m->size != 4 || m->mode != USSE_AM_NONE || (m->fetch && m->neg)
+			|| !reg_ok (m->base) || !reg_ok (m->off)) {
+		return false;
+	}
+	for (i = 0; i < n; i++) {
+		if (!usse_reg_nth (m->data, i, reg, sizeof reg) || (*reg != '#' && !reg_ok (reg))) {
+			return false;
+		}
+		/* a loaded register that is the base or the offset changes the next address */
+		if (m->load && (!strcmp (reg, m->base) || !strcmp (reg, m->off)) && i < n - 1) {
+			return false;
+		}
+	}
+	for (i = 0; i < n; i++) {
+		char elem[16] = "";
+		if (m->fetch) {
+			snprintf (elem, sizeof elem, "%d,", 4 * (i + 1));
+		}
+		snprintf (addr, sizeof addr, "%s0xffff,%s,&,16,%s,>>,*,%s,%s,%s0xffffffff,&",
+			elem, m->off, m->off, m->base, m->neg ? "-" : "+", m->fetch ? "+," : "");
+		usse_reg_nth (m->data, i, reg, sizeof reg);
+		if (m->load) {
+			r_strbuf_appendf (sb, "%s%s,[4],%s,=", i ? "," : "", addr, reg);
+		} else {
+			r_strbuf_appendf (sb, "%s,3,&,!,?{,%s,%s,=[4],}", addr,
+				*reg == '#' ? reg + 1 : reg, addr);
+		}
 	}
 	return true;
 }
@@ -675,7 +904,8 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 	} else if (bitwise && sched && argc == 3 && simple_tok (args[0]) && simple_tok (args[1]) && simple_tok (args[2])) {
 		const char *sym = !strcmp (base, "and") ? "&" : !strcmp (base, "or") ? "|" : "^";
 		snprintf (e, sizeof e, "%s,%s,%s,%s,=", esil_tok (args[2]), esil_tok (args[1]), sym, args[0]);
-	} else if (shift && sched && argc == 3 && simple_tok (args[0]) && simple_tok (args[1]) && simple_tok (args[2])) {
+	} else if (shift && sched && argc == 3 && simple_tok (args[0]) && simple_tok (args[1]) && *args[2] == '#'
+			&& simple_tok (args[2]) && strtoull (args[2] + 1, NULL, 0) < 32) {
 		const char *sym = !strcmp (base, "shl") ? "<<" : ">>";
 		snprintf (e, sizeof e, "%s,%s,%s,%s,=", esil_tok (args[2]), esil_tok (args[1]), sym, args[0]);
 	} else if ((!strcmp (base, "ba") || !strcmp (base, "br")) && argc == 1) {
@@ -700,18 +930,21 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 		ab = r_strbuf_new ("");
 		if (strstr (opw, ".test")) {
 			ok = test_esil (ab, base, opw, args, argc);
-		} else if ((bitwise || !strcmp (base, "rol") || !strcmp (base, "asr")) && sched && argc == 3
+		} else if ((bitwise || shift || !strcmp (base, "rol") || !strcmp (base, "asr")) && sched && argc == 3
 				&& dst_ok (args[0], &nowrite) && !nowrite
 				&& src_parse (args[1], &sa) && src_parse (args[2], &sb)) {
 			ok = alu_val (ab, base, &sa, &sb) && r_strbuf_appendf (ab, ",%s,=", args[0]);
 		} else if (!strcmp (base, "imae") || !strcmp (base, "ima32")) {
 			ok = imul_esil (ab, base, opw, args, argc);
+		} else if (!strcmp (base, "ima16")) {
+			ok = ima16_esil (ab, opw, args, argc);
 		} else if (*base == 'f') {
 			ok = flt_esil (ab, base, opw, args, argc);
 		} else if (!strcmp (base, "ldr") || !strcmp (base, "str")) {
 			ok = cr_esil (ab, base, opw, args, argc);
-		} else if (!strcmp (base, "mov") && !cond[0]) {
-			ok = mov_repeat_esil (ab, opw, args, argc);
+		} else if (!strcmp (base, "mov")) {
+			ok = (strchr (args[0], '[') || strchr (args[1], '[') || !strcmp (args[0], "i.l"))
+				? idx_esil (ab, opw, args, argc) : mov_repeat_esil (ab, opw, args, argc);
 		}
 		if (!ok) {
 			r_strbuf_free (ab);
@@ -723,7 +956,7 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 	RStrBuf *mb = NULL;
 	if (!e[0] && !ab && argc >= 2 && usse_memop_parse (opw, args[0], args[1], &mo)) {
 		mb = r_strbuf_new ("");
-		if (!mem_esil (&mo, mb)) {
+		if (!(mo.imm ? mem_esil (&mo, mb) : mem_reg_esil (&mo, mb))) {
 			r_strbuf_free (mb);
 			mb = NULL;
 		}
