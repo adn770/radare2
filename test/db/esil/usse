@@ -112,9 +112,9 @@ NAME=USSE ESIL leaves uncharacterised forms unmodelled
 FILE=malloc://256
 ARGS=-a usse -b 32
 CMDS=<<EOF
-wx 82000c0091110848 82000c0081112848 0301200000102050 0301200004100050 82024100800400a8 8481200000400000 8481208000002200 0001200000160008 0001200000140008 0001200004100008 0001200000300008 0100800c000020fc 0301200000180060 0301200000100057
+wx 82000c0091110848 82000c0081112848 0301200000102050 0301200004100050 82024100800400a8 8481208000002200 0001200000160008 0001200000140008 0001200004100008 0100800c000020fc 0301200000180060 0301200000100057
 e asm.esil=true
-pi 14
+pi 12
 EOF
 EXPECT=<<EOF
 and.testtaz.chan1 !c0, p0, r1, r2
@@ -122,12 +122,10 @@ and.onceonly.testtaz.chan0 !c0, p0, r1, r2
 and.repeat2 r1, r2, r3
 and.partial r1, r2, r3
 imae.usat r2, r4.low, r5.low, r2, u32
-fmad.incs010 r1, r2, r3, r4
 fmad r1, r2, #3, r4
 fexp r1, r2
 flog r1, r2
 frcp.tpres r1, r2
-frcp r1.xy, r2
 mov r100, #0x00000001
 shl r1, r2, ~r3
 Pn and r1, r2, r3
@@ -687,5 +685,335 @@ r14,il,=
 4,0xffff,r3,&,16,r3,>>,*,r2,+,+,0xffffffff,&,[4],r4,=,8,0xffff,r3,&,16,r3,>>,*,r2,+,+,0xffffffff,&,[4],r5,=
 0xffff,r19,&,16,r19,>>,*,r17,+,0xffffffff,&,3,&,!,?{,r20,0xffff,r19,&,16,r19,>>,*,r17,+,0xffffffff,&,=[4],}
 p1,?{,r1,r2,=,r2,r3,=,}
+EOF
+RUN
+NAME=USSE ESIL for write masks (a repeat of four with gaps)
+FILE=malloc://512
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 80004021005001288000802208a001508002c00300200008ff40802500300150
+aei
+aeim
+ar r1=0x00000011
+ar r2=0x00000022
+ar r3=0x00000033
+ar r4=0x00000044
+ar r6=0x40800000
+ar r10=0xeeeeeeee
+ar r11=0xeeeeeeee
+ar r12=0xeeeeeeee
+ar r13=0xeeeeeeee
+ar r20=0xeeeeeeee
+ar r21=0xeeeeeeee
+ar r22=0xeeeeeeee
+ar r23=0xeeeeeeee
+ar r30=0xeeeeeeee
+ar r31=0xeeeeeeee
+ar r44=0xeeeeeeee
+ar r45=0xeeeeeeee
+ar r46=0xeeeeeeee
+aes 4
+ar r10
+ar r11
+ar r12
+ar r13
+ar r20
+ar r21
+ar r22
+ar r23
+ar r30
+ar r31
+ar r44
+ar r45
+ar r46
+EOF
+EXPECT=<<EOF
+0x00000011
+0xeeeeeeee
+0x00000033
+0xeeeeeeee
+0xeeeeeeee
+0x00000022
+0xeeeeeeee
+0x00000044
+0xeeeeeeee
+0x3e800000
+0x00000011
+0x00000022
+0xeeeeeeee
+EOF
+RUN
+
+NAME=USSE ESIL for fmad repeats and .incsXYZ
+FILE=malloc://512
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 854140010011000085418001001020008541c00100d000008541000200200000
+aei
+aeim
+ar r1=0x3f800000
+ar r2=0x40400000
+ar r3=0x40a00000
+ar r4=0x40e00000
+ar r5=0x42c80000
+ar r6=0x43480000
+aes 4
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+ar r16
+ar r17
+ar r18
+EOF
+EXPECT=<<EOF
+0x42d20000
+0x434d0000
+0x42d20000
+0x435d0000
+0x42d20000
+0x42f20000
+0x42d20000
+0x42d20000
+0x42d20000
+EOF
+RUN
+
+NAME=USSE ESIL for the float dot products fdp and fddp
+FILE=malloc://512
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 850040010030201085008002005000100601c0030000201085410005001228103419c00600102010
+aei
+aeim
+ar r1=0x3f800000
+ar r2=0x40000000
+ar r3=0x40800000
+ar r4=0x41000000
+ar r5=0x3f800000
+ar r6=0x41800000
+ar r7=0x43800000
+ar r8=0x45800000
+ar r10=0xeeeeeeee
+ar r11=0xeeeeeeee
+ar r12=0xeeeeeeee
+ar r20=0xeeeeeeee
+ar r50=0x3f800800
+ar r51=0x3f800800
+ar r52=0x3f800800
+ar r53=0xbf801000
+ar r54=0xeeeeeeee
+aes 5
+ar r10
+ar r11
+ar r12
+ar r13
+ar r20
+ar r21
+ar r30
+ar r40
+ar r41
+ar i1
+ar r54
+ar r55
+EOF
+EXPECT=<<EOF
+0xeeeeeeee
+0xeeeeeeee
+0xeeeeeeee
+0x47042100
+0xeeeeeeee
+0x40400000
+0x42000000
+0x00000000
+0x41a00000
+0x42040000
+0xeeeeeeee
+0xb9801000
+EOF
+RUN
+
+NAME=USSE ESIL for fminmax and fmaxmin
+FILE=malloc://512
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 034140010002201882c060010002201881818001000220188241a0010000201882c0c001000020188280e10100022018830201020002201805c22102000020188343800200920018
+aei
+aeim
+ar r1=0x3f800000
+ar r2=0x40000000
+ar r3=0x40400000
+ar r4=0x80000000
+ar r5=0x00000000
+ar r6=0x7fc00000
+ar r7=0xbf800000
+aes 9
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+ar r16
+ar r17
+ar r20
+ar r21
+EOF
+EXPECT=<<EOF
+0x40000000
+0x40000000
+0x3f800000
+0x40400000
+0x40000000
+0x3f800000
+0x00000000
+0x80000000
+0x3f800000
+0x40000000
+EOF
+RUN
+
+NAME=USSE ESIL for movc
+FILE=malloc://512
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 0341400100130028030161018012002803018101001140280341a101001440280381c1010014002803c1e101801440280301020200154028
+aei
+aeim
+ar r1=0x00000000
+ar r2=0x62222222
+ar r3=0xb3333333
+ar r4=0x0000ff80
+ar r5=0xbf800000
+ar r6=0x00000001
+ar r7=0x7fc00000
+ar r8=0x40000200
+aes 7
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+ar r16
+EOF
+EXPECT=<<EOF
+0x62222222
+0xb3332222
+0xb3332222
+0x62222222
+0x62222222
+0xb3333333
+0x33333222
+EOF
+RUN
+
+NAME=USSE ESIL for movmsk
+FILE=malloc://512
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 8200400100160028820060012016002882008001801600288200a001a01600288300c001801640288500e001401640288500000200164028
+aei
+aeim
+ar r1=0x11223344
+ar r2=0x0000ff01
+ar r3=0x3f000000
+ar r5=0x37ff3c00
+ar r10=0xeeeeeeee
+ar r11=0xeeeeeeee
+ar r12=0xeeeeeeee
+ar r13=0xeeeeeeee
+ar r14=0xeeeeeeee
+ar r15=0xeeeeeeee
+ar r16=0xeeeeeeee
+aes 7
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+ar r16
+EOF
+EXPECT=<<EOF
+0x11223344
+0x11223344
+0xeeeeeeee
+0x11223344
+0x11223344
+0xeeeeeeee
+0x11223344
+EOF
+RUN
+
+NAME=USSE ESIL for packs and unpacks
+FILE=malloc://512
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 820040013c1c0040840164013c1c0040860388017c1c00400404a401bc1c00408602c001fc1c00400404fc013c1d004082000002181c0040860224027c1c004089048602bc1100408904a702bc1300408904c502bc1500408904e102bc17004089040603bc190040894423037c100040890443033c130040
+aei
+aeim
+ar r1=0x3f800000
+ar r2=0x40000000
+ar r3=0x3f000000
+ar r4=0xbf000000
+ar r5=0x43960000
+ar r6=0xc0a00000
+ar r7=0x40200000
+ar r8=0x3f400000
+ar r9=0x80ff7f01
+ar r16=0xa0a1a2a3
+aes 15
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+ar r16
+ar r17
+ar r20
+ar r21
+ar r22
+ar r23
+ar r24
+ar r25
+ar r26
+EOF
+EXPECT=<<EOF
+0x02010201
+0x00800080
+0xfb02fb02
+0x40df40df
+0x0000012c
+0xc0005fff
+0xa00201a3
+0x817f817f
+0x3f800000
+0xbf800000
+0xbc010204
+0x477f7f00
+0xbf7e03fc
+0x7f7f7f7f
+0x0001ff80
+EOF
+RUN
+
+NAME=USSE ESIL leaves i3, an empty mask, fdpc, .smsk and f16 packs alone
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 803f402100100128800000250000012885404001000020100341400120170028820040017c1d0040
+e asm.esil=true
+pi 5
+EOF
+EXPECT=<<EOF
+mov r10, i3
+mov r40., r1
+fdpc r10, cp0, r1, r5
+movmsk.mask.smsk r10, r1, r2, r3.1
+pckf16f32 r10, r1.0, r2.0, nearest
 EOF
 RUN
