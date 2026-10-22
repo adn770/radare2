@@ -47,8 +47,10 @@ static bool reg_ok(const char *r) {
  * pinned, and every flag is a scheduling flag (skipinv, syncs, nosched, end)
  * that does not change what a single instance computes. Repeats other than
  * those of mov, fmad, fminmax/fmaxmin and fdp/fddp, partial and once-only
- * forms, half/fixed-point formats and the multi-channel tests are left
+ * forms, half-float and c10 operands and the multi-channel tests are left
  * without ESIL; a write mask is a repeat of four with gaps (measured). The
+ * 8-bit colour operations, integer dot products, fpma, efo, fadm/fmsa/
+ * fsubflr and statomic follow the third round of probes. The
  * semantics follow the hardware probes (sgxhumation tools/usse-asm/probe.py).
  * Loads/stores follow memop.h,
  * including the fetch forms' extra element and the post-increment writeback;
@@ -1179,20 +1181,26 @@ static bool comp_src(const char *t, char *reg, size_t n, int *c) {
 
 /* movmsk.<fmt> d, s1, s2.c: s1 is moved into d when s2 passes (measured):
  * .mask bit 0 of byte c, .u8 bit 7 of byte c, .flt s2 >= 0.5 (a NaN fails),
- * .flt16 the half c (bits 0-15, 8-23, 16-31, 16-31) >= 0.5. .smsk is not
- * modelled. */
+ * .flt16 the half c (bits 0-15, 8-23, 16-31, 16-31) >= 0.5; with .smsk
+ * (movmsk.<fmt>.smsk d, s0, s1, s2.c) bit 0 of s0 must be set too, except
+ * for .mask. */
 static bool movmsk_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
-	static const char * const fl[] = { "mask", "flt", "flt16", "u8", NULL };
+	static const char * const fl[] = { "mask", "flt", "flt16", "u8", "smsk", NULL };
 	char reg[24];
 	int c, nf = 0, i;
 	bool nowrite;
-	for (i = 0; fl[i]; i++) {
+	const bool smsk = has_flag (opw, "smsk");
+	for (i = 0; i < 4; i++) {
 		nf += has_flag (opw, fl[i]);
 	}
-	if (argc != 3 || nf != 1 || !flags_ok (opw, fl, NULL, NULL) || !dst_ok (args[0], &nowrite) || nowrite
-			|| !simple_tok (args[1]) || !comp_src (args[2], reg, sizeof reg, &c)) {
+	if (argc != 3 + smsk || nf != 1 || !flags_ok (opw, fl, NULL, NULL) || !dst_ok (args[0], &nowrite)
+			|| nowrite || (smsk && !simple_tok (args[1])) || !simple_tok (args[1 + smsk])
+			|| !comp_src (args[2 + smsk], reg, sizeof reg, &c)) {
 		return false;
 	}
+	/* .smsk: the move also needs bit 0 of source 0, but for .mask (measured) */
+	const char *s0 = smsk && !has_flag (opw, "mask") ? esil_tok (args[1]) : NULL;
+	args += smsk;
 	char *cond = NULL;
 	if (has_flag (opw, "mask") || has_flag (opw, "u8")) {
 		cond = r_str_newf ("1,%d,%s,>>,&", 8 * c + (has_flag (opw, "u8") ? 7 : 0), reg);
@@ -1208,7 +1216,11 @@ static bool movmsk_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
 			sh, reg, hm, hm);
 		free (hm);
 	}
-	r_strbuf_appendf (sb, "%s,?{,%s,%s,=,}", cond, esil_tok (args[1]), args[0]);
+	if (s0) {
+		r_strbuf_appendf (sb, "1,%s,&,%s,&,?{,%s,%s,=,}", s0, cond, esil_tok (args[1]), args[-1]);
+	} else {
+		r_strbuf_appendf (sb, "%s,?{,%s,%s,=,}", cond, esil_tok (args[1]), args[smsk ? -1 : 0]);
+	}
 	free (cond);
 	return true;
 }
@@ -1505,6 +1517,712 @@ static bool mask_esil(RStrBuf *sb, const char *base, const char *opw, char **arg
 	return true;
 }
 
+/* ---- round 2 of the hardware probes: colour operations, integer dot
+ * products, fpma, efo, fadm/fmsa/fsubflr, statomic ----
+ * The colour forms work on bytes, byte 3 the alpha, a channel x standing for
+ * x / 255 (measured, sgxhumation tools/usse-asm/progs/probes/colour.toml).
+ * ESIL has no temporaries, so these helpers build expressions that repeat
+ * their operands; every string is kept in the arena and freed at the end. */
+
+typedef struct {
+	RList *l;
+} EArena;
+
+static const char *ea_put(EArena *a, char *s) {
+	if (s) {
+		r_list_append (a->l, s);
+	}
+	return s;
+}
+
+#define EA(...) ea_put (ar, r_str_newf (__VA_ARGS__))
+
+/* byte b of a register */
+static const char *e_byte(EArena *ar, const char *reg, int b) {
+	return b ? EA ("0xff,%d,%s,>>,&", 8 * b, reg) : EA ("0xff,%s,&", reg);
+}
+
+/* ESIL keeps the strings it stacks in a ring of 32 bytes per stack slot, so
+ * a value must not stay stacked while hundreds of others are pushed: the
+ * helpers evaluate each operand once (DUP/SWAP) and the longer one first. */
+
+/* max(x, 0) */
+static const char *e_relu(EArena *ar, const char *x) {
+	return EA ("%s,DUP,63,SWAP,>>,1,-,*", x);
+}
+
+/* the smaller and the larger of two signed values */
+static const char *e_min(EArena *ar, const char *a, const char *b) {
+	return EA ("%s,DUP,%s,SWAP,-,DUP,63,SWAP,>>,1,-,*,SWAP,-", a, b);
+}
+
+static const char *e_max(EArena *ar, const char *a, const char *b) {
+	return EA ("%s,DUP,%s,-,DUP,63,SWAP,>>,1,-,*,+", a, b);
+}
+
+/* p / q rounded to nearest (halves up) for p >= 0, and capped at hi */
+static const char *e_round_cap(EArena *ar, const char *p, int q, int hi) {
+	return EA ("%s,2,*,%d,+,%d,SWAP,/,DUP,%d,SWAP,-,DUP,63,SWAP,>>,1,-,*,SWAP,-", p, q, 2 * q, hi);
+}
+
+/* d / q rounded to nearest (halves away from zero) and clamped to [lo, hi],
+ * for a signed d; lo is 0 or -hi */
+static const char *e_rdiv(EArena *ar, const char *d, int q, int hi, bool sgn) {
+	const char *pos = e_round_cap (ar, e_relu (ar, d), q, hi);
+	if (!sgn) {
+		return pos;
+	}
+	const char *neg = e_round_cap (ar, e_relu (ar, EA ("%s,0,-", d)), q, hi);
+	return EA ("%s,%s,-", neg, pos);
+}
+
+/* x / 255 rounded and saturated to 0..255 */
+static const char *e_sat(EArena *ar, const char *d) {
+	return e_rdiv (ar, d, 255, 255, false);
+}
+
+/* a colour selector without its .comp, and whether it had one */
+static bool sel_split(const char *t, char *n, size_t sz, bool *comp) {
+	size_t l = strlen (t);
+	*comp = l > 5 && !strcmp (t + l - 5, ".comp");
+	if (*comp) {
+		l -= 5;
+	}
+	if (!l || l >= sz) {
+		return false;
+	}
+	memcpy (n, t, l);
+	n[l] = 0;
+	return true;
+}
+
+/* The value of a sop3/lrp/sop2wm selector (also sop2's, but s2scale and
+ * zeros) in byte b, b = 3 being the alpha reading: zero, one, the sources'
+ * channels and alphas, asat = min(s1a, 1 - s2a) (.comp: min(1 - s1a, s2a)),
+ * 1 for an alpha. NULL: not a selector. */
+static const char *e_sel(EArena *ar, const char *t, const char *s0, const char *s1, const char *s2, int b) {
+	char n[12];
+	bool c;
+	const char *v = NULL;
+	if (!sel_split (t, n, sizeof n, &c)) {
+		return NULL;
+	}
+	if (!strcmp (n, "asat")) {
+		if (b == 3) {
+			return "255";
+		}
+		const char *a1 = e_byte (ar, s1, 3), *a2 = e_byte (ar, s2, 3);
+		return c ? e_min (ar, EA ("%s,255,-", a1), a2) : e_min (ar, a1, EA ("%s,255,-", a2));
+	}
+	if (!strcmp (n, "zero")) {
+		v = "0";
+	} else if (!strcmp (n, "one")) {
+		v = "255";
+	} else if (n[0] == 's' && n[1] >= '0' && n[1] <= '2' && (!n[2] || (n[2] == 'a' && !n[3]))) {
+		const char *r = n[1] == '0' ? s0 : n[1] == '1' ? s1 : s2;
+		if (!r) {
+			return NULL;
+		}
+		v = e_byte (ar, r, n[2] ? 3 : b);
+	} else {
+		return NULL;
+	}
+	return c ? EA ("%s,255,-", v) : v;
+}
+
+/* x1 * f1 op x2 * f2 for add or sub, as a signed sum of products */
+static const char *e_addsub(EArena *ar, const char *op, const char *x1, const char *f1, const char *x2,
+		const char *f2) {
+	if (!strcmp (op, "add")) {
+		return EA ("%s,%s,*,%s,%s,*,+", f2, x2, f1, x1);
+	}
+	return strcmp (op, "sub") ? NULL : EA ("%s,%s,*,%s,%s,*,-", f2, x2, f1, x1);
+}
+
+/* The operands of a colour instruction: plain profile registers. */
+static bool colour_reg(const char *t) {
+	return *t != '#' && simple_tok (t);
+}
+
+/* Split "a, b, c" into at most n items (in place). */
+static int split_list(char *s, char **out, int n) {
+	int k = 0;
+	while (s && k < n) {
+		out[k++] = s;
+		char *c = strstr (s, ", ");
+		if (!c) {
+			break;
+		}
+		*c = 0;
+		s = c + 2;
+	}
+	return k;
+}
+
+/* Place four byte expressions, or keep a byte of d where mask bit b is clear. */
+static void bytes_out(RStrBuf *sb, EArena *ar, const char *v[4], const char *d, int mask) {
+	int b;
+	for (b = 0; b < 4; b++) {
+		const char *x = (mask >> b & 1) ? v[b] : e_byte (ar, d, b);
+		if (b) {
+			r_strbuf_appendf (sb, ",%s,%d,*,|", x, 1 << (8 * b));
+		} else {
+			r_strbuf_append (sb, x);
+		}
+	}
+	r_strbuf_appendf (sb, ",%s,=", d);
+}
+
+/* sop2 d, s1, s2, [comp, ]f1, f2, op+asop2 [comp, ]g1, g2, aop[, neg] (measured):
+ * add/sub sum the exact products, divide by 255 once, round and saturate;
+ * min/max compare the sources (factors and comp ignored); s2scale (first
+ * factor) doubles the result; zeros (second factor) is 0, .comp 1, and makes
+ * s2 signed (s2 - 0.5) in add/sub; comp complements s1 in add/sub; neg
+ * negates the alpha before saturating. */
+static const char *sop2_byte(EArena *ar, char **c, int n, const char *s1, const char *s2, int b, bool neg) {
+	int k = 0;
+	const bool comp = n == 4 && !strcmp (c[0], "comp");
+	if (n != 3 + comp) {
+		return NULL;
+	}
+	k = comp;
+	char n1[12], n2[12];
+	bool c1, c2;
+	if (!sel_split (c[k], n1, sizeof n1, &c1) || !sel_split (c[k + 1], n2, sizeof n2, &c2)) {
+		return NULL;
+	}
+	const char *op = c[k + 2];
+	const char *x1 = e_byte (ar, s1, b), *x2 = e_byte (ar, s2, b);
+	const int scale = strcmp (n1, "s2scale") ? 1 : 2;
+	const char *f1 = scale == 2 ? (c1 ? EA ("%s,255,-", e_byte (ar, s2, b)) : e_byte (ar, s2, b))
+		: (strcmp (n1, "zeros") ? e_sel (ar, c[k], NULL, s1, s2, b) : NULL);
+	const char *f2;
+	bool zs = false;
+	if (!strcmp (n2, "zeros")) {
+		f2 = c2 ? "255" : "0";
+		zs = true;
+	} else {
+		f2 = strcmp (n2, "s2scale") ? e_sel (ar, c[k + 1], NULL, s1, s2, b) : NULL;
+	}
+	if (!f1 || !f2 || ((n1[0] == 's' && n1[1] == '0') || (n2[0] == 's' && n2[1] == '0'))) {
+		return NULL;
+	}
+	const char *d;
+	if (!strcmp (op, "min") || !strcmp (op, "max")) {
+		const char *m = !strcmp (op, "min") ? e_min (ar, x1, x2) : e_max (ar, x1, x2);
+		d = EA ("%d,%s,*", 255 * scale, m);
+	} else {
+		if (comp) {
+			x1 = EA ("%s,255,-", x1);
+		}
+		if (zs) {
+			x2 = EA ("128,%s,-", x2);
+		}
+		d = e_addsub (ar, op, x1, f1, x2, f2);
+		if (d && scale == 2) {
+			d = EA ("2,%s,*", d);
+		}
+	}
+	if (d && neg) {
+		d = EA ("%s,0,-", d);
+	}
+	return d ? e_sat (ar, d) : NULL;
+}
+
+/* sop3/lrp1/lrp2 colour of byte b < 3 (measured): sop3 = op(s1 f1, s2 f2), its
+ * neg form -op(s1 f2, s2 f1); lrp1 = x (1 - t) + y t, t = s0 or s0a; lrp2 =
+ * f1 m1 + f2 m2 with (m1, m2) = (s1, s2), (s1, 1 - s2), (1, s2), (1 - s1, s2). */
+static const char *sop3_colour(EArena *ar, const char *kind, char **c, int n, const char *s0,
+		const char *s1, const char *s2, int b) {
+	if (!strcmp (kind, "sop3")) {
+		const bool neg = n == 4 && !strcmp (c[3], "neg");
+		if (n != 3 + neg) {
+			return NULL;
+		}
+		const char *f1 = e_sel (ar, c[neg ? 1 : 0], s0, s1, s2, b);
+		const char *f2 = e_sel (ar, c[neg ? 0 : 1], s0, s1, s2, b);
+		const char *d = f1 && f2 ? e_addsub (ar, c[2], e_byte (ar, s1, b), f1, e_byte (ar, s2, b), f2) : NULL;
+		return d ? e_sat (ar, neg ? EA ("%s,0,-", d) : d) : NULL;
+	}
+	if (!strcmp (kind, "lrp1")) {
+		char nx[12], ny[12];
+		bool cx, cy;
+		if (n != 3 || !sel_split (c[0], nx, sizeof nx, &cx) || !sel_split (c[1], ny, sizeof ny, &cy)
+				|| (strcmp (nx, "zero") && strcmp (nx, "s1")) || (strcmp (ny, "zero") && strcmp (ny, "s2"))
+				|| (strcmp (c[2], "s0") && strcmp (c[2], "s0a"))) {
+			return NULL;
+		}
+		const char *x = e_sel (ar, c[0], s0, s1, s2, b), *y = e_sel (ar, c[1], s0, s1, s2, b);
+		const char *t = e_byte (ar, s0, strcmp (c[2], "s0") ? 3 : b);
+		return e_sat (ar, EA ("%s,%s,*,%s,255,-,%s,*,+", t, y, t, x));
+	}
+	if (n != 4) {
+		return NULL;
+	}
+	const char *f1 = e_sel (ar, c[0], s0, s1, s2, b), *f2 = e_sel (ar, c[1], s0, s1, s2, b);
+	const char *m1 = !strcmp (c[2], "one") ? "255" : !strcmp (c[2], "s1") ? e_byte (ar, s1, b)
+		: !strcmp (c[2], "s1.comp") ? EA ("%s,255,-", e_byte (ar, s1, b)) : NULL;
+	const char *m2 = !strcmp (c[3], "s2") ? e_byte (ar, s2, b)
+		: !strcmp (c[3], "s2.comp") && !strcmp (c[2], "s1") ? EA ("%s,255,-", e_byte (ar, s2, b)) : NULL;
+	if (!f1 || !f2 || !m1 || !m2 || (!strcmp (c[3], "s2.comp") && strcmp (c[2], "s1"))) {
+		return NULL;
+	}
+	return e_sat (ar, EA ("%s,%s,*,%s,%s,*,+", m2, f2, m1, f1));
+}
+
+/* the sop3/lrp alpha: asop a, f2, op = op(s1a a, s2a f2); arsop a, op =
+ * -op(s1a f2, s2a a), f2 the colour's second selector; alrp a, b =
+ * a (1 - s0a) + b s0a */
+static const char *sop3_alpha(EArena *ar, const char *akind, char **a, int n, const char *f2c,
+		const char *s0, const char *s1, const char *s2) {
+	const char *a1 = e_byte (ar, s1, 3), *a2 = e_byte (ar, s2, 3);
+	if (!strcmp (akind, "asop") && n == 3) {
+		const char *x = e_sel (ar, a[0], s0, s1, s2, 3), *y = e_sel (ar, a[1], s0, s1, s2, 3);
+		const char *d = x && y ? e_addsub (ar, a[2], a1, x, a2, y) : NULL;
+		return d ? e_sat (ar, d) : NULL;
+	}
+	if (!strcmp (akind, "arsop") && n == 2 && f2c) {
+		const char *x = e_sel (ar, a[0], s0, s1, s2, 3), *y = e_sel (ar, f2c, s0, s1, s2, 3);
+		const char *d = x && y ? e_addsub (ar, a[1], a1, y, a2, x) : NULL;
+		return d ? e_sat (ar, EA ("%s,0,-", d)) : NULL;
+	}
+	if (!strcmp (akind, "alrp") && n == 2) {
+		const char *x = e_sel (ar, a[0], s0, s1, s2, 3), *y = e_sel (ar, a[1], s0, s1, s2, 3);
+		const char *t = e_byte (ar, s0, 3);
+		return x && y ? e_sat (ar, EA ("%s,%s,*,%s,255,-,%s,*,+", t, y, t, x)) : NULL;
+	}
+	return NULL;
+}
+
+static bool colour_esil(RStrBuf *sb, const char *base, const char *opw, const char *text) {
+	char *s = strdup (text), *plus, *ops[8], *col[6], *al[6];
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	bool ok = false;
+	const char *v[4] = { 0 };
+	int no, nc, na = 0, mask = 15, b;
+	char *sp = strchr (s, ' ');
+	if (!sp || !flags_ok (opw, NULL, NULL, NULL)) {
+		goto out;
+	}
+	plus = strchr (sp, '+');
+	char *akind = NULL;
+	if (plus) {
+		*plus = 0;
+		akind = plus + 1;
+		char *asp = strchr (akind, ' ');
+		if (!asp) {
+			goto out;
+		}
+		*asp = 0;
+		na = split_list (asp + 1, al, 6);
+	}
+	const bool three = strcmp (base, "sop2") && strcmp (base, "sop2wm");
+	no = split_list (sp + 1, ops, 8);
+	if (no < 3 + three + 2) {
+		goto out;
+	}
+	char d[24];
+	snprintf (d, sizeof d, "%s", ops[0]);
+	if (!strcmp (base, "sop2wm")) {
+		char *m = strstr (d, ".bytemask");
+		if (!m || strlen (m) != 13) {
+			goto out;
+		}
+		mask = 0;
+		for (b = 0; b < 4; b++) {
+			mask |= (m[9 + b] == '1') << (3 - b);
+		}
+		*m = 0;
+	}
+	const char *s0 = three ? ops[1] : NULL, *s1 = ops[1 + three], *s2 = ops[2 + three];
+	if (!colour_reg (d) || !colour_reg (s1) || !colour_reg (s2) || (s0 && !colour_reg (s0))) {
+		goto out;
+	}
+	nc = no - 3 - three;
+	memcpy (col, ops + 3 + three, nc * sizeof (char *));
+	if (!strcmp (base, "sop2")) {
+		if (!akind || strcmp (akind, "asop2")) {
+			goto out;
+		}
+		const bool neg = na >= 1 && !strcmp (al[na - 1], "neg");
+		for (b = 0; b < 4; b++) {
+			v[b] = b < 3 ? sop2_byte (ar, col, nc, s1, s2, b, false)
+				: sop2_byte (ar, al, na - neg, s1, s2, 3, neg);
+		}
+	} else if (!strcmp (base, "sop2wm")) {
+		if (akind || nc != 4) {
+			goto out;
+		}
+		for (b = 0; b < 4; b++) {
+			const char *op = col[b < 3 ? 2 : 3];
+			const char *x1 = e_byte (ar, s1, b), *x2 = e_byte (ar, s2, b);
+			const char *f1 = e_sel (ar, col[0], NULL, s1, s2, b), *f2 = e_sel (ar, col[1], NULL, s1, s2, b);
+			if (!f1 || !f2) {
+				goto out;
+			}
+			v[b] = !strcmp (op, "min") ? e_min (ar, x1, x2) : !strcmp (op, "max") ? e_max (ar, x1, x2) : NULL;
+			if (!v[b]) {
+				const char *dd = e_addsub (ar, op, x1, f1, x2, f2);
+				v[b] = dd ? e_sat (ar, dd) : NULL;
+			}
+		}
+	} else {
+		if (!akind) {
+			goto out;
+		}
+		for (b = 0; b < 3; b++) {
+			v[b] = sop3_colour (ar, base, col, nc, s0, s1, s2, b);
+		}
+		v[3] = sop3_alpha (ar, akind, al, na, nc > 1 ? col[1] : NULL, s0, s1, s2);
+	}
+	for (b = 0; b < 4; b++) {
+		if (!v[b]) {
+			goto out;
+		}
+	}
+	bytes_out (sb, ar, v, d, mask);
+	ok = true;
+out:
+	r_list_free (a.l);
+	free (s);
+	return ok;
+}
+
+/* u8dot3/u8dot4/u16dot3/u16dot4[off] (measured): S = the sum of the byte
+ * products over bytes 0-2 or 0-3 (off: of (x - 128)(y - 128)); u8: S Cx / 255
+ * into bytes 0-2, S Ax / 255 (or u8dot3's alpha operation) into byte 3, each
+ * rounded and saturated; u16: S Cx 32767 / 255^2 into both halves, saturated
+ * to 0x7fff (+-0x7fff with off). */
+static bool dot_esil(RStrBuf *sb, const char *base, const char *opw, const char *text) {
+	char *s = strdup (text), *ops[8], *al[6];
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	bool ok = false;
+	int na = 0, i;
+	const bool u16 = base[1] == '1', off = strstr (base, "off") != NULL;
+	const int n = strstr (base, "dot4") ? 4 : 3;
+	char *sp = strchr (s, ' '), *plus = sp ? strchr (sp, '+') : NULL, *akind = NULL;
+	if (!sp || !flags_ok (opw, NULL, NULL, NULL)) {
+		goto out;
+	}
+	if (plus) {
+		*plus = 0;
+		akind = plus + 1;
+		char *asp = strchr (akind, ' ');
+		if (!asp || u16 || n != 3) {
+			goto out;
+		}
+		*asp = 0;
+		na = split_list (asp + 1, al, 6);
+	}
+	int no = split_list (sp + 1, ops, 8);
+	const bool hasax = no == 5;
+	if (no != 4 + hasax || strncmp (ops[1], "Cx", 2) || (hasax && strncmp (ops[2], "Ax", 2))) {
+		goto out;
+	}
+	const int cx = atoi (ops[1] + 2), ax = hasax ? atoi (ops[2] + 2) : cx;
+	char x[24], y[24];
+	bool cmx, cmy;
+	if (!sel_split (ops[2 + hasax], x, sizeof x, &cmx) || !sel_split (ops[3 + hasax], y, sizeof y, &cmy)
+			|| !colour_reg (x) || !colour_reg (y) || !colour_reg (ops[0])) {
+		goto out;
+	}
+	RStrBuf *sum = r_strbuf_new ("0");
+	for (i = 0; i < n; i++) {
+		const char *bx = e_byte (ar, x, i), *by = e_byte (ar, y, i);
+		if (cmx) {
+			bx = EA ("%s,255,-", bx);
+		}
+		if (cmy) {
+			by = EA ("%s,255,-", by);
+		}
+		if (off) {
+			bx = EA ("128,%s,-", bx);
+			by = EA ("128,%s,-", by);
+		}
+		r_strbuf_appendf (sum, ",%s,%s,*,+", by, bx);
+	}
+	const char *S = ea_put (ar, r_strbuf_drain (sum));
+	if (u16) {
+		const char *h = e_rdiv (ar, EA ("%d,%s,*", 32767 * cx, S), 65025, 0x7fff, off);
+		r_strbuf_appendf (sb, "%s,0xffff,&,DUP,65536,*,|,%s,=", h, ops[0]);
+		ok = true;
+		goto out;
+	}
+	const char *v[4];
+	v[0] = v[1] = v[2] = e_sat (ar, EA ("%d,%s,*", cx, S));
+	v[3] = e_sat (ar, EA ("%d,%s,*", ax, S));
+	if (akind) {
+		const char *a1 = e_byte (ar, x, 3), *a2 = e_byte (ar, y, 3);
+		v[3] = NULL;
+		if ((!strcmp (akind, "aadd") || !strcmp (akind, "asub")) && na == 5 && !strncmp (al[0], "Ax", 2)) {
+			const char *f1 = e_sel (ar, al[1], NULL, x, y, 3), *f2 = e_sel (ar, al[3], NULL, x, y, 3);
+			const char *v1 = !strcmp (al[2], "s1a") ? a1 : !strcmp (al[2], "s1a.comp") ? EA ("%s,255,-", a1) : NULL;
+			const char *v2 = !strcmp (al[4], "s2a") ? a2 : NULL;
+			const char *d = f1 && f2 && v1 && v2 ? e_addsub (ar, akind + 1, v1, f1, v2, f2) : NULL;
+			v[3] = d ? e_sat (ar, EA ("%d,%s,*", atoi (al[0] + 2), d)) : NULL;
+		} else if ((!strcmp (akind, "aintrp1") || !strcmp (akind, "aintrp2")) && na == 3 && colour_reg (al[0])) {
+			const char *p = e_sel (ar, al[1], NULL, x, y, 3), *q = e_sel (ar, al[2], NULL, x, y, 3);
+			const char *t = e_byte (ar, al[0], 3);
+			if (p && q) {
+				if (akind[6] == '2') {
+					p = EA ("%s,255,-", p);
+				}
+				v[3] = e_sat (ar, EA ("%s,%s,*,%s,255,-,%s,*,+", t, q, t, p));
+			}
+		}
+		if (!v[3]) {
+			goto out;
+		}
+	}
+	bytes_out (sb, ar, v, ops[0], 15);
+	ok = true;
+out:
+	r_list_free (a.l);
+	free (s);
+	return ok;
+}
+
+/* fpma d, s0, s1, s2, c0, c1, c2, a0, a1, a2 = c0 + c1 c2 per channel (alpha
+ * a0 + a1 a2), rounded and saturated (measured); .neg negates s0; .sat
+ * changed nothing measured; c10 operands are not modelled. */
+static bool fpma_esil(RStrBuf *sb, const char *opw, const char *text) {
+	static const char * const sat[] = { "sat", NULL };
+	char *s = strdup (text), *ops[12];
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	bool ok = false;
+	int b;
+	char *sp = strchr (s, ' ');
+	if (!sp || !flags_ok (opw, sat, NULL, NULL) || split_list (sp + 1, ops, 12) != 10) {
+		goto out;
+	}
+	char s0[24];
+	snprintf (s0, sizeof s0, "%s", ops[1]);
+	const bool neg = strlen (s0) > 4 && !strcmp (s0 + strlen (s0) - 4, ".neg");
+	if (neg) {
+		s0[strlen (s0) - 4] = 0;
+	}
+	if (!colour_reg (ops[0]) || !colour_reg (s0) || !colour_reg (ops[2]) || !colour_reg (ops[3])) {
+		goto out;
+	}
+	const char *v[4];
+	for (b = 0; b < 4; b++) {
+		const char *t[3];
+		int k;
+		for (k = 0; k < 3; k++) {
+			char n[12];
+			bool c;
+			if (!sel_split (ops[(b < 3 ? 4 : 7) + k], n, sizeof n, &c) || n[0] != 's' || n[1] < '0' || n[1] > '2') {
+				goto out;
+			}
+			const char *r = n[1] == '0' ? s0 : ops[2 + n[1] - '1'];
+			const char *x = e_byte (ar, r, (n[2] == 'a') ? 3 : b);
+			if (n[1] == '0' && neg) {
+				x = EA ("%s,0,-", x);
+			}
+			t[k] = c ? EA ("%s,255,-", x) : x;
+		}
+		v[b] = e_sat (ar, EA ("%s,%s,*,255,%s,*,+", t[2], t[1], t[0]));
+	}
+	bytes_out (sb, ar, v, ops[0], 15);
+	ok = true;
+out:
+	r_list_free (a.l);
+	free (s);
+	return ok;
+}
+
+/* The binary32 sum (or difference) of two binary32 bit expressions, rounded
+ * and flushed. */
+static const char *f_sum(EArena *ar, const char *x, const char *y, bool sub) {
+	return EA ("32,32,%s,F2D,32,%s,F2D,%s,D2F,"FLT_FLUSH, y, x, sub ? "F-" : "F+");
+}
+
+static const char *f_mul(EArena *ar, const char *x, const char *y) {
+	return EA ("32,32,%s,F2D,32,%s,F2D,F*,D2F,"FLT_FLUSH, y, x);
+}
+
+/* A float source's flushed bits (src_bits) in the arena. */
+static const char *f_src(EArena *ar, const char *t) {
+	RStrBuf *b = r_strbuf_new ("");
+	if (!src_bits (b, t)) {
+		r_strbuf_free (b);
+		return NULL;
+	}
+	return ea_put (ar, r_strbuf_drain (b));
+}
+
+/* fadm d, a, b, c = a.c + b.c, fmsa d, a, b, c = a.a + b.c, each product and
+ * the sum rounded; fsubflr d, a, b = a - floor(b) (measured). */
+static bool fmisc_esil(RStrBuf *sb, const char *base, const char *opw, char **args, int argc) {
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	bool nowrite, ok = false;
+	if (!flags_ok (opw, NULL, NULL, NULL) || !dst_ok (args[0], &nowrite) || nowrite) {
+		goto out;
+	}
+	if (!strcmp (base, "fsubflr") && argc == 3) {
+		const char *x = f_src (ar, args[1]), *y = f_src (ar, args[2]);
+		if (x && y) {
+			r_strbuf_appendf (sb, "32,32,%s,F2D,FLOOR,32,%s,F2D,F-,D2F,"FLT_FLUSH",%s,=", y, x, args[0]);
+			ok = true;
+		}
+	} else if (argc == 4) {
+		const char *x = f_src (ar, args[1]), *y = f_src (ar, args[2]), *z = f_src (ar, args[3]);
+		if (x && y && z) {
+			const char *p = !strcmp (base, "fadm") ? f_mul (ar, x, z) : f_mul (ar, x, x);
+			r_strbuf_appendf (sb, "%s,%s,=", f_sum (ar, p, f_mul (ar, y, z), false), args[0]);
+			ok = true;
+		}
+	}
+out:
+	r_list_free (a.l);
+	return ok;
+}
+
+/* efo (measured): m0, m1 multiply the named sources or i0/i1, a0, a1 add or
+ * subtract the named values, each rounded to binary32; d takes a0, a1 or the
+ * old i0/i1; i0 and i1 are written after (! keeps them). Not modelled:
+ * .gpiext (it moves the multipliers' i0/i1 and the writes to i2/i3, but one
+ * pixel in four sees another instance's values), sources with a half-float
+ * reading ("a/b") and repeats. */
+static bool efo_esil(RStrBuf *sb, const char *opw, const char *text) {
+	char *s = strdup (text), *it[10];
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	bool ok = false;
+	char *sp = strchr (s, ' '), *eq = sp ? strstr (sp, "= ") : NULL;
+	if (!sp || !eq || strchr (s, '/') || !flags_ok (opw, NULL, NULL, NULL)) {
+		goto out;
+	}
+	*eq = 0;
+	const char *d = sp + 1;
+	/* dsel, i0w, i1w, a0..., a1..., m0..., m1..., s0, s1, s2 ("a0=x+y a1=..." has no comma) */
+	int n = split_list (eq + 2, it, 10), k = 0;
+	char a0[24], a1[24];
+	if (n == 9) {
+		char *t = strstr (it[3], " a1=");
+		if (!t) {
+			goto out;
+		}
+		*t = 0;
+		snprintf (a0, sizeof a0, "%s", it[3]);
+		snprintf (a1, sizeof a1, "%s", t + 1);
+		k = -1;
+	} else if (n == 10) {
+		snprintf (a0, sizeof a0, "%s", it[3]);
+		snprintf (a1, sizeof a1, "%s", it[4]);
+	} else {
+		goto out;
+	}
+	const char *m0t = it[5 + k], *m1t = it[6 + k];
+	const char *src[3];
+	int i;
+	for (i = 0; i < 3; i++) {
+		src[i] = f_src (ar, it[7 + k + i]);
+		if (!src[i]) {
+			goto out;
+		}
+	}
+	bool nowrite;
+	if (!dst_ok (d, &nowrite) || nowrite || (strcmp (it[0], "a0") && strcmp (it[0], "a1")
+			&& strcmp (it[0], "i0") && strcmp (it[0], "i1"))) {
+		goto out;
+	}
+	/* operands: srcN, i0, i1, flushed as every float input */
+	const char *i0f = EA ("i0,"FLT_FLUSH), *i1f = EA ("i1,"FLT_FLUSH);
+#define EFO_OPND(t) (!strcmp (t, "src0") ? src[0] : !strcmp (t, "src1") ? src[1] \
+		: !strcmp (t, "src2") ? src[2] : !strcmp (t, "i0") ? i0f : !strcmp (t, "i1") ? i1f : NULL)
+	const char *m[2];
+	const char *mt[2] = { m0t, m1t };
+	for (i = 0; i < 2; i++) {
+		char x[8], y[8];
+		if (sscanf (mt[i], "m%*d=%7[a-z0-9]*%7[a-z0-9]", x, y) != 2 || !EFO_OPND (x) || !EFO_OPND (y)) {
+			goto out;
+		}
+		m[i] = f_mul (ar, EFO_OPND (x), EFO_OPND (y));
+	}
+	/* a0=X(+|-)Y, a1=[-]X+Y */
+	const char *av[2];
+	const char *at[2] = { a0, a1 };
+	for (i = 0; i < 2; i++) {
+		const char *e = at[i] + 3;
+		const bool lneg = *e == '-';
+		char x[8], y[8], opc;
+		if (lneg) {
+			e++;
+		}
+		if (sscanf (e, "%7[a-z0-9]%c%7[a-z0-9]", x, &opc, y) != 3 || (opc != '+' && opc != '-')) {
+			goto out;
+		}
+		const char *vx = !strcmp (x, "m0") ? m[0] : !strcmp (x, "m1") ? m[1] : EFO_OPND (x);
+		const char *vy = !strcmp (y, "m0") ? m[0] : !strcmp (y, "m1") ? m[1] : EFO_OPND (y);
+		if (!vx || !vy) {
+			goto out;
+		}
+		if (lneg) {
+			vx = EA ("0x80000000,%s,^", vx);
+		}
+		av[i] = f_sum (ar, vx, vy, opc == '-');
+	}
+#undef EFO_OPND
+	const char *val[4] = { av[0], av[1], m[0], m[1] };
+	static const char * const vn[4] = { "a0", "a1", "m0", "m1" };
+	const char *w[2] = { NULL, NULL };
+	for (i = 0; i < 2; i++) {
+		char nm[8];
+		const char *t = it[1 + i];
+		const bool skip = *t == '!';
+		if (sscanf (t + skip, "i%*d = %7s", nm) != 1) {
+			goto out;
+		}
+		int j;
+		for (j = 0; j < 4 && strcmp (nm, vn[j]); j++) {
+		}
+		if (j == 4) {
+			goto out;
+		}
+		w[i] = skip ? NULL : val[j];
+	}
+	/* a register name on the ESIL stack is read when popped: read i0/i1 now */
+	const char *dv = !strcmp (it[0], "a0") ? av[0] : !strcmp (it[0], "a1") ? av[1] : EA ("%s,0,|", it[0]);
+	/* push d's value and the writes' values first, then assign */
+	r_strbuf_appendf (sb, "%s", dv);
+	if (w[0]) {
+		r_strbuf_appendf (sb, ",%s", w[0]);
+	}
+	if (w[1]) {
+		r_strbuf_appendf (sb, ",%s,i1,=", w[1]);
+	}
+	if (w[0]) {
+		r_strbuf_append (sb, ",i0,=");
+	}
+	r_strbuf_appendf (sb, ",%s,=", d);
+	ok = true;
+out:
+	r_list_free (a.l);
+	free (s);
+	return ok;
+}
+
+/* statomic d, s1.c, s2.c writes, in both halves, byte c of s1 (low) and of s2
+ * (high), each read as a signed byte with negatives made 0 (measured); the
+ * rounding mode and .scale change nothing. */
+static bool statomic_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
+	static const char * const sc[] = { "scale", NULL };
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	char r1[24], r2[24];
+	int c1, c2;
+	bool nowrite, ok = false;
+	if (argc == 4 && flags_ok (opw, sc, NULL, NULL) && dst_ok (args[0], &nowrite) && !nowrite
+			&& comp_src (args[1], r1, sizeof r1, &c1) && comp_src (args[2], r2, sizeof r2, &c2)) {
+		const char *x = e_byte (ar, r1, c1), *y = e_byte (ar, r2, c2);
+		x = EA ("%s,DUP,7,SWAP,>>,1,-,*", x);
+		y = EA ("%s,DUP,7,SWAP,>>,1,-,*", y);
+		r_strbuf_appendf (sb, "%s,%s,256,*,|,DUP,65536,*,|,%s,=", x, y, args[0]);
+		ok = true;
+	}
+	r_list_free (a.l);
+	return ok;
+}
+
 static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 	char *s = strdup (text);
 	if (!s) {
@@ -1519,6 +2237,7 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 		neg = 1; cond[0] = 'p'; cond[1] = body[2]; body += 4;
 	}
 
+	const char *btext = text + (body - s);
 	char *sp = strchr (body, ' ');
 	char *opw = body;
 	char *args[8] = {0};
@@ -1616,6 +2335,19 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 			ok = imul_esil (ab, base, opw, args, argc);
 		} else if (!strcmp (base, "ima16")) {
 			ok = ima16_esil (ab, opw, args, argc);
+		} else if (!strcmp (base, "sop2") || !strcmp (base, "sop3") || !strcmp (base, "lrp1")
+				|| !strcmp (base, "lrp2") || !strcmp (base, "sop2wm")) {
+			ok = colour_esil (ab, base, opw, btext);
+		} else if (strstr (base, "dot") && (base[0] == 'u')) {
+			ok = dot_esil (ab, base, opw, btext);
+		} else if (!strcmp (base, "fpma")) {
+			ok = fpma_esil (ab, opw, btext);
+		} else if (!strcmp (base, "efo")) {
+			ok = efo_esil (ab, opw, btext);
+		} else if (!strcmp (base, "fadm") || !strcmp (base, "fmsa") || !strcmp (base, "fsubflr")) {
+			ok = fmisc_esil (ab, base, opw, args, argc);
+		} else if (!strcmp (base, "statomic")) {
+			ok = statomic_esil (ab, opw, args, argc);
 		} else if (*base == 'f') {
 			ok = flt_rep_esil (ab, base, opw, args, argc);
 			if (!ok) {
