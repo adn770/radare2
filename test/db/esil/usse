@@ -112,12 +112,11 @@ NAME=USSE ESIL leaves uncharacterised forms unmodelled
 FILE=malloc://256
 ARGS=-a usse -b 32
 CMDS=<<EOF
-wx 82000c0091110848 82000c0081112848 0301200000102050 0301200004100050 82024100800400a8 8481208000002200 0001200000160008 0001200000140008 0001200004100008 0100800c000020fc 0301200000180060 0301200000100057
+wx 82000c0081112848 0301200000102050 0301200004100050 82024100800400a8 8481208000002200 0001200000160008 0001200000140008 0001200004100008 0100800c000020fc 0301200000180060 0301200000100057
 e asm.esil=true
-pi 12
+pi 11
 EOF
 EXPECT=<<EOF
-and.testtaz.chan1 !c0, p0, r1, r2
 and.onceonly.testtaz.chan0 !c0, p0, r1, r2
 and.repeat2 r1, r2, r3
 and.partial r1, r2, r3
@@ -380,9 +379,9 @@ NAME=USSE ESIL leaves the register-file, repeat, index, memory and 16-bit forms 
 FILE=malloc://256
 ARGS=-a usse -b 32
 CMDS=<<EOF
-wx 0700c028000021fe05230020000029fe0000e027001021280000c0a301202128828006008114084800102020011003280021202000100328800040200210092884810000100020f080812020000121e880812020081001e860010000040025f082000c00911108482801202000100160
+wx 0700c028000021fe05230020000029fe0000e027001021280000c0a301202128828006008114084800102020011003280021202000100328800040200210092884810000100020f080812020000121e880812020081001e860010000040025f02801202000100160
 e asm.esil=true
-pi 14
+pi 13
 EOF
 EXPECT=<<EOF
 ldr r70, #7, drc0
@@ -397,7 +396,6 @@ staw [r2,+r3], r4
 ldad r1, [r2,++r3], drc0
 ldad.fetch2 r1, [r2,-r3], drc0
 stad [sa0,+r2], sa[il + #0]
-and.testtaz.chan1 !c0, p0, r1, r2
 shl r1, r2, #0x00000028
 EOF
 RUN
@@ -1249,5 +1247,348 @@ EOF
 EXPECT=<<EOF
 0xffc00000
 0x7fa00001
+EOF
+RUN
+NAME=USSE ESIL for rlp (rotate left through the predicate, p4 and up alias p0-p3)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 8040400100100070004160010010007080808101001000708081a00100100070
+aei
+aeim
+ar r1=0x80000001
+ar r2=0x12345678
+ar r3=0x00000000
+ar p1=0x00000001
+ar p2=0x00000000
+aes 4
+ar r10
+ar r11
+ar p1
+ar r12
+ar r13
+ar p2
+EOF
+EXPECT=<<EOF
+0x00000003
+0x2468acf1
+0x00000000
+0x00000002
+0x00000001
+0x00000000
+EOF
+RUN
+
+NAME=USSE ESIL for test channels on a 32-bit result (absent channels test positive non-zero)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 82000c009111084882000c009512084882000c00d911084882000c00cd180848
+aei
+aeim
+ar r1=0x00000000
+ar r2=0xffffffff
+ar p0=0x00000001
+ar p1=0x00000000
+ar p2=0x00000000
+ar p3=0x00000000
+aes 4
+ar p0
+ar p1
+ar p2
+ar p3
+EOF
+EXPECT=<<EOF
+0x00000000
+0x00000001
+0x00000001
+0x00000001
+EOF
+RUN
+
+NAME=USSE ESIL for test channels on 16-bit lanes (the high half is channel 2)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 82c00500a111084882c005009511084882c10500f914084882c00500ed110848
+aei
+aeim
+ar r1=0x00000005
+ar r2=0x00000000
+ar r3=0x80000001
+ar p0=0x00000000
+ar p1=0x00000001
+ar p2=0x00000000
+ar p3=0x00000001
+aes 4
+ar p0
+ar p1
+ar p2
+ar p3
+EOF
+EXPECT=<<EOF
+0x00000001
+0x00000000
+0x00000001
+0x00000000
+EOF
+RUN
+
+NAME=USSE ESIL for adif and adifsum
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 82004001000000b082c06001400000b082c08001408000b0
+aei
+aeim
+ar r1=0x10203040
+ar r2=0x0f0e0d0c
+ar r3=0x00800010
+aes 3
+ar r10
+ar r11
+ar r12
+EOF
+EXPECT=<<EOF
+0x01122334
+0x0000007a
+0x000000ea
+EOF
+RUN
+
+NAME=USSE ESIL for the c10 to 16-bit unpacks (three bits of lane 0)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 81404001fc1e0040028165013c1f004083018201fc1e0040
+aei
+aeim
+ar r1=0x3ff550ff
+ar r2=0x000fc150
+ar r3=0x00000110
+aes 3
+ar r10
+ar r11
+ar r12
+EOF
+EXPECT=<<EOF
+0x0000fffe
+0x0000ffff
+0x00008001
+EOF
+RUN
+
+NAME=USSE ESIL for colour, fpma and integer dot repeats (every operand advances)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 820040015014108003418001001000c88200c001001600c0
+aei
+aeim
+ar r1=0x11bd9805
+ar r2=0x52fae253
+ar r3=0xc122acf6
+ar r4=0xae26d9fd
+ar r5=0x6c363355
+aes 3
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+EOF
+EXPECT=<<EOF
+0x1cffff1b
+0xacfaffff
+0x4fdeff55
+0xd6ffffff
+0xffffffff
+0xffffffff
+EOF
+RUN
+
+NAME=USSE ESIL for dual issue: fmad + fadd
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001c04220d8
+aei
+aeim
+ar r1=0x3fc00000
+ar r2=0x40100000
+ar r3=0x40400000
+ar i0=0x40a00000
+ar i1=0x40e00000
+ar i2=0x41300000
+aes 1
+ar r10
+ar i0
+ar i1
+ar i2
+EOF
+EXPECT=<<EOF
+0x40cc0000
+0x41900000
+0x40e00000
+0x41300000
+EOF
+RUN
+
+NAME=USSE ESIL for dual issue: both read before either writes
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 007e4001c00324d8
+aei
+aeim
+ar r1=0x3fc00000
+ar r2=0x40100000
+ar r3=0x40400000
+ar i0=0x40a00000
+ar i1=0x40e00000
+ar i2=0x41300000
+aes 1
+ar r10
+ar i0
+EOF
+EXPECT=<<EOF
+0x40a00000
+0x3fc00000
+EOF
+RUN
+
+NAME=USSE ESIL for dual issue: the secondary wins a shared destination
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 0341a00fe00220d8
+aei
+aeim
+ar r1=0x3fc00000
+ar r2=0x40100000
+ar r3=0x40400000
+ar i0=0x40a00000
+ar i1=0x40e00000
+ar i2=0x41300000
+aes 1
+ar i1
+EOF
+EXPECT=<<EOF
+0x41800000
+EOF
+RUN
+
+NAME=USSE ESIL for dual issue: the secondary reads the old value
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 0341800fe00220d8
+aei
+aeim
+ar r1=0x3fc00000
+ar r2=0x40100000
+ar r3=0x40400000
+ar i0=0x40a00000
+ar i1=0x40e00000
+ar i2=0x41300000
+aes 1
+ar i0
+ar i1
+EOF
+EXPECT=<<EOF
+0x40cc0000
+0x41800000
+EOF
+RUN
+
+NAME=USSE ESIL for dual issue: a repeat runs both twice
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001c01600d8
+aei
+aeim
+ar r1=0x3fc00000
+ar r2=0x40100000
+ar r3=0x40400000
+ar i0=0x40a00000
+ar i1=0x40e00000
+ar i2=0x41300000
+ar r4=0x40a00000
+aes 1
+ar r10
+ar r11
+ar i0
+EOF
+EXPECT=<<EOF
+0x40cc0000
+0x413c0000
+0x41980000
+EOF
+RUN
+
+NAME=USSE ESIL for dual issue: primaries, secondaries and primary-source references
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001d0c220d803416001604324dc0301800100632cdc0341a001804028dc
+aei
+aeim
+ar r1=0x3fc00000
+ar r2=0x40100000
+ar r3=0x40400000
+ar i0=0x40a00000
+ar i1=0x40e00000
+ar i2=0x41300000
+aes 4
+ar r10
+ar r11
+ar r12
+ar r13
+ar i0
+ar i1
+ar i2
+EOF
+EXPECT=<<EOF
+0xbec00000
+0x40100000
+0x41610000
+0x40400000
+0x45a44c80
+0x429a0000
+0x42840000
+EOF
+RUN
+
+NAME=USSE ESIL leaves dual-issue conflicts, derivatives, gpiext, sampling and i3 alone
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001404328d880004001804324d803414001404020d803414001c04224dc8200400100002020000a4601001400e0803f402100100128
+e asm.esil=true
+pi 7
+EOF
+EXPECT=<<EOF
+fadm r10, r1, r2, r3+fmul i0, i1, i2
+mov r10, r1+ima32 i0, i0, i1, i2
+fmad r10, r1, r2, r3+fmad16 i0, i0, i1, i2
+fminmax r10, r1, r2, r3+fadd i0, i1, i2
+fdsx r10, r1, r2
+smp2d r10, r24, r20, drc0
+mov r10, i3
+EOF
+RUN
+
+NAME=USSE ESIL leaves a dual-issue mov of a modified immediate alone
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 80186086904106d8
+e asm.esil=true
+pi 1
+EOF
+EXPECT=<<EOF
+mov r51, #0x00000031.neg+frsq i0, i1
 EOF
 RUN

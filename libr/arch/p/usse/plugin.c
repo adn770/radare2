@@ -10,6 +10,7 @@
 #include <r_arch.h>
 #include <r_lib.h>
 #include <r_util.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include "usse.h"
 #include "usse_form.h"
@@ -182,7 +183,9 @@ static bool flags_ok(const char *opw, const char * const *extra, char *test, cha
 			memcpy (test, f, n);
 			test[n] = 0;
 			ok = true;
-		} else if (!ok && chan && !*chan && n < 12 && !strncmp (f, "chan", 4)) {
+		} else if (!ok && chan && !*chan && n < 12 && (!strncmp (f, "chan", 4)
+				|| (n == 6 && !strncmp (f, "andall", 6)) || (n == 5 && !strncmp (f, "orall", 5))
+				|| (n == 5 && !strncmp (f, "and02", 5)) || (n == 4 && !strncmp (f, "or02", 4)))) {
 			memcpy (chan, f, n);
 			chan[n] = 0;
 			ok = true;
@@ -324,15 +327,49 @@ static bool lane_sub(RStrBuf *sb, const UsseSrc *a, const UsseSrc *b) {
 	return true;
 }
 
-/* Test group: "<op>.test<S><a|o><Z>.chan0 dst, pN, src1, src2" computes the
+/* One channel's test as an ESIL 0/1 expression: tv the channel's value (NULL:
+ * a channel with no lane, which tests as a positive non-zero value), top its
+ * sign bit; S, the join and Z as test_esil parses them. */
+static char *chan_test(const char *tv, int top, char sgn, char join, const char *zero, bool uns) {
+	char *sx = NULL, *zx = NULL;      /* NULL: true */
+	if (!tv) {
+		const bool sv = sgn != 'n', zv = strcmp (zero, "z") != 0;
+		return strdup ((join == 'a' ? sv && zv : sv || zv) ? "1" : "0");
+	}
+	if (sgn == 'n') {
+		sx = uns ? strdup ("0") : r_str_newf ("%d,%s,>>", top, tv);
+	} else if (sgn == 'p' && !uns) {
+		sx = r_str_newf ("%d,%s,>>,!", top, tv);
+	}
+	if (!strcmp (zero, "z")) {
+		zx = r_str_newf ("%s,!", tv);
+	} else if (!strcmp (zero, "nz")) {
+		zx = r_str_newf ("%s,!,!", tv);
+	}
+	char *r;
+	if ((join == 'o' && (!sx || !zx)) || (!sx && !zx)) {
+		r = strdup ("1");
+	} else if (!sx || !zx) {
+		r = strdup (sx ? sx : zx);
+	} else {
+		r = r_str_newf ("%s,%s,%s", sx, zx, join == 'a' ? "&" : "|");
+	}
+	free (sx);
+	free (zx);
+	return r;
+}
+
+/* Test group: "<op>.test<S><a|o><Z>.<chan> dst, pN, src1, src2" computes the
  * result, sets pN from it and writes dst unless it is "!reg". As measured on
  * the hardware: the sign test S is t (true), n (the sign bit) or p (its
  * complement, >= 0); Z is t (true), z or nz; a/o join them, so an o join with
- * a t side is always true. The bitwise group, the shifts and iadd32 test the
- * 32-bit result; iaddu32 is unsigned (n never, p always true); isub16 and
- * isubu16 test their low lane (chan0), and isubu16's sign tests are not
- * modelled. Other channels (measured to clear pN for z) and the 8-bit and
- * float tests are not modelled. */
+ * a t side is always true. A test has one result per channel: the bitwise
+ * group, the shifts and iadd32 have the 32-bit result as channel 0, isub16
+ * and isubu16 their low lane as channel 0 and their high lane as channel 2;
+ * a channel without a lane tests as a positive non-zero value. chan0-chan3
+ * pick one, andall/orall combine all four and and02/or02 channels 0 and 2.
+ * iaddu32 is unsigned (n never, p always true); isubu16's sign tests, the
+ * 8-bit and float tests are not modelled. */
 static bool test_esil(RStrBuf *sb, const char *base, const char *opw, char **args, int argc) {
 	static const char * const ops[] = { "and", "or", "xor", "shl", "shr", "rol", "asr",
 		"iadd32", "iaddu32", "isub16", "isubu16", NULL };
@@ -340,7 +377,18 @@ static bool test_esil(RStrBuf *sb, const char *base, const char *opw, char **arg
 	bool nowrite, known = false;
 	UsseSrc a, b;
 	int i;
-	if (argc != 4 || !flags_ok (opw, NULL, test, chan) || !*test || strcmp (chan, "chan0")) {
+	static const char * const chans[] = { "chan0", "chan1", "chan2", "chan3", "andall", "orall",
+		"and02", "or02", NULL };
+	int ci = -1;
+	if (argc != 4 || !flags_ok (opw, NULL, test, chan) || !*test) {
+		return false;
+	}
+	for (i = 0; chans[i]; i++) {
+		if (!strcmp (chan, chans[i])) {
+			ci = i;
+		}
+	}
+	if (ci < 0) {
 		return false;
 	}
 	for (i = 0; ops[i]; i++) {
@@ -377,36 +425,34 @@ static bool test_esil(RStrBuf *sb, const char *base, const char *opw, char **arg
 		return false;
 	}
 	const char *val = r_strbuf_get (v);
-	/* the tested value: the result, or the low lane of a 16-bit op */
-	char *tv = lanes ? r_str_newf ("%s,0xffff,&", val) : strdup (val);
+	/* the channels' values: the result as channel 0, or a 16-bit op's lanes as
+	 * channels 0 and 2 */
+	char *tv[4] = { NULL };
+	tv[0] = lanes ? r_str_newf ("%s,0xffff,&", val) : strdup (val);
+	if (lanes) {
+		tv[2] = r_str_newf ("16,%s,>>,0xffff,&", val);
+	}
 	const int top = lanes ? 15 : 31;
-	char *sx = NULL, *zx = NULL;      /* NULL: true */
-	if (sgn == 'n') {
-		sx = uns ? strdup ("0") : r_str_newf ("%d,%s,>>", top, tv);
-	} else if (sgn == 'p' && !uns) {
-		sx = r_str_newf ("%d,%s,>>,!", top, tv);
+	char *ct[4];
+	for (i = 0; i < 4; i++) {
+		ct[i] = chan_test (tv[i], top, sgn, join, zero, uns);
 	}
-	if (!strcmp (zero, "z")) {
-		zx = r_str_newf ("%s,!", tv);
-	} else if (!strcmp (zero, "nz")) {
-		zx = r_str_newf ("%s,!,!", tv);
-	}
-	if (join == 'o' && (!sx || !zx)) {
-		r_strbuf_append (sb, "1");
-	} else if (!sx && !zx) {
-		r_strbuf_append (sb, "1");
-	} else if (!sx || !zx) {
-		r_strbuf_append (sb, sx ? sx : zx);
+	if (ci < 4) {
+		r_strbuf_append (sb, ct[ci]);
+	} else if (ci < 6) {
+		r_strbuf_appendf (sb, "%s,%s,%s,%s,%s,%s,%s", ct[0], ct[1], ci == 4 ? "&" : "|", ct[2],
+			ci == 4 ? "&" : "|", ct[3], ci == 4 ? "&" : "|");
 	} else {
-		r_strbuf_appendf (sb, "%s,%s,%s", sx, zx, join == 'a' ? "&" : "|");
+		r_strbuf_appendf (sb, "%s,%s,%s", ct[0], ct[2], ci == 6 ? "&" : "|");
 	}
 	r_strbuf_appendf (sb, ",%s,=", args[1]);
 	if (!nowrite) {
 		r_strbuf_appendf (sb, ",%s,%s,=", val, args[0]);
 	}
-	free (sx);
-	free (zx);
-	free (tv);
+	for (i = 0; i < 4; i++) {
+		free (ct[i]);
+		free (tv[i]);
+	}
 	r_strbuf_free (v);
 	return true;
 }
@@ -2223,6 +2269,327 @@ static bool statomic_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
 	return ok;
 }
 
+/* ---- round 3 of the hardware probes: rlp, adif/adifsum, the c10 to 16-bit
+ * unpacks, colour/fpma/dot repeats and the dual issue ---- */
+
+/* rlp d, s, pN (measured): d = s << 1 | pN, then pN = bit 31 of s; predicate
+ * numbers 4 and up alias p0-p3 (number mod 4). The new pN is stacked first, so
+ * d may be s. */
+static bool rlp_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
+	bool nowrite;
+	UsseSrc a;
+	if (argc != 3 || !flags_ok (opw, NULL, NULL, NULL) || !dst_ok (args[0], &nowrite) || nowrite
+			|| args[2][0] != 'p' || !isdigit ((unsigned char)args[2][1])) {
+		return false;
+	}
+	const int pn = atoi (args[2] + 1) & 3;
+	if (!src_parse (args[1], &a) || !src_plain (&a) || a.imm) {
+		return false;
+	}
+	r_strbuf_appendf (sb, "31,%s,>>,p%d,1,%s,<<,|,0xffffffff,&,%s,=,p%d,=", a.tok, pn, a.tok, args[0], pn);
+	return true;
+}
+
+/* adif d, a, b = |a - b| per byte; adifsum d, s0.low|high, a, b = the sum of
+ * the four plus that 16-bit half of s0 (measured). */
+static bool adif_esil(RStrBuf *sb, const char *base, const char *opw, char **args, int argc) {
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	const bool sum = !strcmp (base, "adifsum");
+	bool nowrite, ok = false;
+	int b;
+	if (argc != 3 + sum || !flags_ok (opw, NULL, NULL, NULL) || !dst_ok (args[0], &nowrite) || nowrite) {
+		goto out;
+	}
+	char s0[24] = { 0 };
+	bool high = false;
+	if (sum) {
+		const char *dot = strchr (args[1], '.');
+		if (!dot || (strcmp (dot, ".low") && strcmp (dot, ".high")) || (size_t)(dot - args[1]) >= sizeof s0) {
+			goto out;
+		}
+		memcpy (s0, args[1], dot - args[1]);
+		high = dot[1] == 'h';
+		if (!colour_reg (s0)) {
+			goto out;
+		}
+	}
+	const char *x = args[1 + sum], *y = args[2 + sum];
+	if (!colour_reg (x) || !colour_reg (y)) {
+		goto out;
+	}
+	const char *d[4];
+	for (b = 0; b < 4; b++) {
+		const char *bx = e_byte (ar, x, b), *by = e_byte (ar, y, b);
+		d[b] = EA ("%s,%s,-", e_min (ar, bx, by), e_max (ar, bx, by));
+	}
+	if (sum) {
+		r_strbuf_appendf (sb, "%s,%s,+,%s,+,%s,+,", d[0], d[1], d[2], d[3]);
+		r_strbuf_appendf (sb, high ? "16,%s,>>,+,0xffffffff,&,%s,=" : "0xffff,%s,&,+,0xffffffff,&,%s,=",
+			s0, args[0]);
+	} else {
+		r_strbuf_appendf (sb, "%s,24,%s,<<,|,16,%s,<<,|,8,%s,<<,|,%s,=", d[0], d[3], d[2], d[1], args[0]);
+	}
+	ok = true;
+out:
+	r_list_free (a.l);
+	return ok;
+}
+
+/* unpcku16c10/unpcks16c10[.scale] d, s1.c, s2.c, mode (measured): no
+ * conversion; lane 0 of s1's register whatever the selects, its bit 4 into
+ * bit 15, bit 6 into bits 1-14 and bit 8 into bit 0 of d; the high half 0. */
+static bool c10u16_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
+	static const char * const fl[] = { "scale", NULL };
+	char reg[24];
+	bool nowrite;
+	if (argc != 4 || !flags_ok (opw, fl, NULL, NULL) || !dst_ok (args[0], &nowrite) || nowrite
+			|| strchr (args[0], '.')) {
+		return false;
+	}
+	snprintf (reg, sizeof reg, "%.*s", (int) strcspn (args[1], "."), args[1]);
+	if (!colour_reg (reg)) {
+		return false;
+	}
+	r_strbuf_appendf (sb, "1,8,%s,>>,&,0x7ffe,1,6,%s,>>,&,*,|,0x8000,1,4,%s,>>,&,*,|,%s,=",
+		reg, reg, reg, args[0]);
+	return true;
+}
+
+/* text with every register operand moved k registers on (r10 -> r12); false
+ * when one leaves the profile. Flags are not touched. */
+static char *text_step(const char *text, int k) {
+	RStrBuf *o = r_strbuf_new ("");
+	const char *p = text, *sp = strchr (text, ' ');
+	if (!sp) {
+		r_strbuf_free (o);
+		return NULL;
+	}
+	r_strbuf_append_n (o, text, sp - text);
+	for (p = sp; *p; ) {
+		const bool tokstart = (*p == 'r' || *p == 'p' || *p == 'o' || *p == 's' || *p == 'i')
+			&& (p[-1] == ' ' || p[-1] == ',');
+		if (tokstart) {
+			size_t n = strspn (p, "abcdefghijklmnopqrstuvwxyz0123456789");
+			char tok[24], out[48];
+			if (n < sizeof tok) {
+				memcpy (tok, p, n);
+				tok[n] = 0;
+				char bank[8];
+				int num;
+				if (reg_ok (tok) && reg_split (tok, bank, sizeof bank, &num) && strcmp (bank, "i")) {
+					if (!reg_offset (tok, k, out, sizeof out)) {
+						r_strbuf_free (o);
+						return NULL;
+					}
+					r_strbuf_append (o, out);
+					p += n;
+					continue;
+				}
+			}
+		}
+		r_strbuf_append_n (o, p, 1);
+		p++;
+	}
+	return r_strbuf_drain (o);
+}
+
+/* The opcode word without its .repeatN flag. */
+static char *opw_norep(const char *opw) {
+	char *r = strdup (opw), *f = strstr (r, ".repeat");
+	if (f) {
+		const char *e = strchr (f + 1, '.');
+		memmove (f, e ? e : f + strlen (f), strlen (e ? e : f + strlen (f)) + 1);
+	}
+	return r;
+}
+
+/* sop2, fpma and the integer dot products with .repeatN (measured): each
+ * iteration advances the destination and every register source by one, in
+ * order. */
+static bool colour_rep_esil(RStrBuf *sb, const char *base, const char *opw, const char *text) {
+	const int n = rep_count (opw);
+	char *o = opw_norep (opw);
+	char *t1 = strdup (text), *f = strstr (t1, ".repeat");
+	bool ok = n > 1 && f;
+	int k;
+	if (ok) {
+		const char *e = f + 7 + strspn (f + 7, "0123456789");
+		memmove (f, e, strlen (e) + 1);
+	}
+	for (k = 0; ok && k < n; k++) {
+		char *tk = text_step (t1, k);
+		RStrBuf *one = r_strbuf_new ("");
+		ok = tk && (!strcmp (base, "fpma") ? fpma_esil (one, o, tk)
+			: !strcmp (base, "sop2") ? colour_esil (one, base, o, tk) : dot_esil (one, base, o, tk));
+		if (ok) {
+			r_strbuf_appendf (sb, "%s%s", k ? "," : "", r_strbuf_get (one));
+		}
+		r_strbuf_free (one);
+		free (tk);
+	}
+	free (t1);
+	free (o);
+	return ok;
+}
+
+/* ---- dual issue (class 27, measured) ----
+ * "primary+secondary": both operations read the registers as they were
+ * before the word, the secondary wins a shared destination, .repeat2 runs
+ * both twice (the primary's operands advance, the secondary's internal
+ * registers stay) and the predicate covers both. Only the pairs that
+ * co-issue cleanly are modelled: pairs that need the same unit give mixed
+ * results, ima32 as a secondary fits no model, fexp/flog/fsin/fcos have no
+ * ESIL operation, fmad16 is not modelled and fddp writes the secondary's
+ * destination itself. */
+static const char *dual_pair_ok(const char *prim, const char *sec) {
+	static const char * const tab[][2] = {
+		{ "mov", " fmad fmsa fmaxmin fsubflr fadd fsub fmul frcp frsq mov " },
+		{ "fmad", " fmad fsubflr fadd fsub fmul frcp frsq mov " },
+		{ "ima32", " fmad fmsa fsubflr fadd fsub fmul frcp frsq mov " },
+		{ "fadm", " fsubflr fadd fsub frcp frsq mov " },
+		{ "fmsa", " fsubflr fadd fsub frcp frsq mov " },
+		{ "fssq", " fsubflr fadd fsub frcp frsq mov " },
+		{ "fminmax", " fmul frcp frsq mov " },
+	};
+	size_t i;
+	char key[16];
+	snprintf (key, sizeof key, " %s ", sec);
+	for (i = 0; i < sizeof tab / sizeof tab[0]; i++) {
+		if (!strcmp (prim, tab[i][0])) {
+			return strstr (tab[i][1], key) ? tab[i][0] : NULL;
+		}
+	}
+	return NULL;
+}
+
+/* Split "op a, b, c" into the op word and its operands (in place). */
+static int split_ins(char *t, char **opw, char **args, int max) {
+	char *sp = strchr (t, ' ');
+	int n = 0;
+	*opw = t;
+	if (!sp) {
+		return 0;
+	}
+	*sp = 0;
+	char *p = sp + 1;
+	while (p && n < max) {
+		args[n++] = p;
+		char *c = strstr (p, ", ");
+		if (!c) {
+			break;
+		}
+		*c = 0;
+		p = c + 2;
+	}
+	return n;
+}
+
+/* The register of an operand (its text up to the first '.'). */
+static void op_reg(const char *t, char *out, size_t n) {
+	snprintf (out, n, "%.*s", (int) strcspn (t, "."), t);
+}
+
+/* One operation of a dual-issue word as an assignment, or false. */
+static bool dual_one(RStrBuf *sb, const char *op, char **args, int argc, bool primary) {
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	bool nowrite, ok = false;
+	if (!dst_ok (args[0], &nowrite) || nowrite || strchr (args[0], '.')) {
+		goto out;
+	}
+	if (!strcmp (op, "mov")) {
+		/* a modifier (an immediate's ".neg") is not modelled */
+		ok = argc == 2 && simple_tok (args[1]) && !strchr (args[1], '.');
+		if (ok) {
+			r_strbuf_appendf (sb, "%s,%s,=", esil_tok (args[1]), args[0]);
+		}
+	} else if (!strcmp (op, "fmad") || !strcmp (op, "frcp") || !strcmp (op, "frsq")) {
+		ok = flt_esil (sb, op, op, args, argc);
+	} else if (!strcmp (op, "fadm") || !strcmp (op, "fmsa") || !strcmp (op, "fsubflr")) {
+		ok = fmisc_esil (sb, op, op, args, argc);
+	} else if (!strcmp (op, "fminmax") || !strcmp (op, "fmaxmin")) {
+		ok = argc == 4 && minmax_one (sb, op, args);
+	} else if (!strcmp (op, "ima32") && primary) {
+		UsseSrc x, y, z;
+		ok = argc == 4 && src_parse (args[1], &x) && src_plain (&x) && src_parse (args[2], &y)
+			&& src_plain (&y) && src_parse (args[3], &z) && src_plain (&z);
+		if (ok) {
+			r_strbuf_appendf (sb, "%s,%s,%s,*,+,0xffffffff,&,%s,=", z.tok, y.tok, x.tok, args[0]);
+		}
+	} else if (!strcmp (op, "fadd") || !strcmp (op, "fsub") || !strcmp (op, "fmul") || !strcmp (op, "fssq")) {
+		const char *x = argc == 3 ? f_src (ar, args[1]) : NULL, *y = argc == 3 ? f_src (ar, args[2]) : NULL;
+		ok = x && y;
+		if (ok) {
+			const char *v = !strcmp (op, "fmul") ? f_mul (ar, x, y)
+				: !strcmp (op, "fssq") ? f_sum (ar, f_mul (ar, x, x), f_mul (ar, y, y), false)
+				: f_sum (ar, x, y, op[1] == 's');
+			r_strbuf_appendf (sb, "%s,%s,=", v, args[0]);
+		}
+	}
+out:
+	r_list_free (a.l);
+	return ok;
+}
+
+static bool dual_esil(RStrBuf *sb, const char *text) {
+	char *t = strdup (text), *plus = strchr (t, '+');
+	char *popw, *sopw, *pa[6], *sa[6];
+	bool ok = false;
+	int pn, sn, i, k;
+	if (!plus) {
+		goto out;
+	}
+	*plus = 0;
+	pn = split_ins (t, &popw, pa, 6);
+	sn = split_ins (plus + 1, &sopw, sa, 6);
+	char pbase[16];
+	snprintf (pbase, sizeof pbase, "%.*s", (int) strcspn (popw, "."), popw);
+	static const char * const rep[] = { "repeat2", NULL };
+	if (pn < 2 || sn < 2 || strchr (sopw, '.') || !flags_ok (popw, rep, NULL, NULL)
+			|| !dual_pair_ok (pbase, sopw)) {
+		goto out;
+	}
+	/* the order: the secondary last (it wins a shared destination), unless
+	 * the primary writes a register the secondary reads */
+	char pd[24], sd[24], r[24];
+	op_reg (pa[0], pd, sizeof pd);
+	op_reg (sa[0], sd, sizeof sd);
+	bool p_feeds_s = false, s_feeds_p = false;
+	for (i = 1; i < sn; i++) {
+		op_reg (sa[i], r, sizeof r);
+		p_feeds_s |= !strcmp (r, pd);
+	}
+	for (i = 1; i < pn; i++) {
+		op_reg (pa[i], r, sizeof r);
+		s_feeds_p |= !strcmp (r, sd);
+	}
+	if ((p_feeds_s && s_feeds_p) || (p_feeds_s && !strcmp (pd, sd))) {
+		goto out;
+	}
+	const int n = has_flag (popw, "repeat2") ? 2 : 1;
+	if (n > 1 && (p_feeds_s || s_feeds_p)) {
+		goto out;
+	}
+	for (k = 0; k < n; k++) {
+		UsseArgs st;
+		RStrBuf *P = r_strbuf_new (""), *S = r_strbuf_new ("");
+		bool good = args_step (pa, pn, k, 0xff, &st) && dual_one (P, pbase, st.v, pn, true)
+			&& dual_one (S, sopw, sa, sn, false);
+		if (good) {
+			r_strbuf_appendf (sb, "%s%s,%s", k ? "," : "", p_feeds_s ? r_strbuf_get (S) : r_strbuf_get (P),
+				p_feeds_s ? r_strbuf_get (P) : r_strbuf_get (S));
+		}
+		r_strbuf_free (P);
+		r_strbuf_free (S);
+		if (!good) {
+			goto out;
+		}
+	}
+	ok = true;
+out:
+	free (t);
+	return ok;
+}
+
 static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 	char *s = strdup (text);
 	if (!s) {
@@ -2323,7 +2690,25 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 		char mdb[48];
 		int wm;
 		ab = r_strbuf_new ("");
-		if (!strstr (opw, ".test") && dst_mask (args[0], mdb, sizeof mdb, &wm)) {
+		const char *pl = strchr (btext, '+');
+		while (pl && !isalpha ((unsigned char)pl[1])) {
+			pl = strchr (pl + 1, '+');
+		}
+		const bool dual = pl && (!strcmp (base, "fmad") || !strcmp (base, "fadm")
+			|| !strcmp (base, "fmsa") || !strcmp (base, "fminmax") || !strcmp (base, "ima32")
+			|| !strcmp (base, "mov") || !strcmp (base, "fssq") || !strcmp (base, "fddp"));
+		if (dual) {
+			ok = dual_esil (ab, btext);
+		} else if (!strcmp (base, "rlp")) {
+			ok = rlp_esil (ab, opw, args, argc);
+		} else if (!strcmp (base, "adif") || !strcmp (base, "adifsum")) {
+			ok = adif_esil (ab, base, opw, args, argc);
+		} else if (!strcmp (base, "unpcku16c10") || !strcmp (base, "unpcks16c10")) {
+			ok = c10u16_esil (ab, opw, args, argc);
+		} else if (rep_count (opw) > 1 && (!strcmp (base, "sop2") || !strcmp (base, "fpma")
+				|| (strstr (base, "dot") && base[0] == 'u'))) {
+			ok = colour_rep_esil (ab, base, opw, btext);
+		} else if (!strstr (opw, ".test") && dst_mask (args[0], mdb, sizeof mdb, &wm)) {
 			ok = mask_esil (ab, base, opw, args, argc);
 		} else if (strstr (opw, ".test")) {
 			ok = test_esil (ab, base, opw, args, argc);
