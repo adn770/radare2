@@ -112,9 +112,9 @@ NAME=USSE ESIL leaves uncharacterised forms unmodelled
 FILE=malloc://256
 ARGS=-a usse -b 32
 CMDS=<<EOF
-wx 82000c0081112848 0301200000102050 0301200004100050 82024100800400a8 8481208000002200 0001200000160008 0001200000140008 0001200004100008 0100800c000020fc 0301200000180060 0301200000100057
+wx 82000c00811128480301200000102050030120000410005082024100800400a884812080000022000001200000160008000120000014000800012000041000080100800c000020fc
 e asm.esil=true
-pi 11
+pi 9
 EOF
 EXPECT=<<EOF
 and.onceonly.testtaz.chan0 !c0, p0, r1, r2
@@ -126,8 +126,6 @@ fexp r1, r2
 flog r1, r2
 frcp.tpres r1, r2
 mov r100, #0x00000001
-shl r1, r2, ~r3
-Pn and r1, r2, r3
 EOF
 RUN
 
@@ -379,9 +377,9 @@ NAME=USSE ESIL leaves the register-file, repeat, index, memory and 16-bit forms 
 FILE=malloc://256
 ARGS=-a usse -b 32
 CMDS=<<EOF
-wx 0700c028000021fe05230020000029fe0000e027001021280000c0a301202128828006008114084800102020011003280021202000100328800040200210092884810000100020f080812020000121e880812020081001e860010000040025f02801202000100160
+wx 0700c028000021fe05230020000029fe0000e027001021280000c0a301202128828006008114084800102020011003280021202000100328800040200210092884810000100020f080812020000121e880812020081001e860010000040025f0
 e asm.esil=true
-pi 13
+pi 12
 EOF
 EXPECT=<<EOF
 ldr r70, #7, drc0
@@ -396,7 +394,6 @@ staw [r2,+r3], r4
 ldad r1, [r2,++r3], drc0
 ldad.fetch2 r1, [r2,-r3], drc0
 stad [sa0,+r2], sa[il + #0]
-shl r1, r2, #0x00000028
 EOF
 RUN
 
@@ -1561,19 +1558,16 @@ EXPECT=<<EOF
 EOF
 RUN
 
-NAME=USSE ESIL leaves dual-issue conflicts, derivatives, gpiext, sampling and i3 alone
+NAME=USSE ESIL leaves fmad + fmad16, derivatives, sampling and i3 alone
 FILE=malloc://256
 ARGS=-a usse -b 32
 CMDS=<<EOF
-wx 03414001404328d880004001804324d803414001404020d803414001c04224dc8200400100002020000a4601001400e0803f402100100128
+wx 03414001404020d88200400100002020000a4601001400e0803f402100100128
 e asm.esil=true
-pi 7
+pi 4
 EOF
 EXPECT=<<EOF
-fadm r10, r1, r2, r3+fmul i0, i1, i2
-mov r10, r1+ima32 i0, i0, i1, i2
 fmad r10, r1, r2, r3+fmad16 i0, i0, i1, i2
-fminmax r10, r1, r2, r3+fadd i0, i1, i2
 fdsx r10, r1, r2
 smp2d r10, r24, r20, drc0
 mov r10, i3
@@ -1590,5 +1584,350 @@ pi 1
 EOF
 EXPECT=<<EOF
 mov r51, #0x00000031.neg+frsq i0, i1
+EOF
+RUN
+
+NAME=USSE ESIL for shift immediates of 32 and over and ~ amounts (probe shift-immediates)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx a100402100100160a800602100100168a100802108100168a100a021081001608200c001001800608200e0010018006883000022081801608300202200180160
+aei
+aeim
+ar r1=0x80000003
+ar r2=0xfffffffc
+aes 8
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+ar r16
+ar r17
+EOF
+EXPECT=<<EOF
+0x00000000
+0x00000000
+0xffffffff
+0x00000007
+0x00000018
+0x10000000
+0x38000000
+0x00000000
+EOF
+RUN
+
+NAME=USSE ESIL for the Pn predicate: the instruction never runs (probe predicate-pn)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 8000402100100128000140210010012f
+aei
+aeim
+ar r1=0x00000005
+ar r2=0x00000007
+ar p0=0x00000001
+ar p1=0x00000001
+ar p2=0x00000001
+ar p3=0x00000001
+aes 2
+ar r10
+EOF
+EXPECT=<<EOF
+0x00000005
+EOF
+RUN
+
+NAME=USSE ESIL for idiv: quotient and remainder, all ones for a zero divisor (probe idiv)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 82004001000010d084018001000010d08602c001000010d0
+aei
+aeim
+ar r1=0x00000064
+ar r2=0x00000007
+ar r3=0x00000007
+ar r4=0x00000000
+ar r5=0xffffffff
+ar r6=0x00000003
+aes 3
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+EOF
+EXPECT=<<EOF
+0x0000000e
+0x00000002
+0xffffffff
+0xffffffff
+0x55555555
+0x00000000
+EOF
+RUN
+
+NAME=USSE ESIL for imae saturation, shift, source-2 types and carries (probe imae-modes)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001800420a903416001800c20a903418001a00000a80341a001400000a80341c001000010a80341e001800200a803410002808120a9
+aei
+aeim
+ar r1=0xffff0003
+ar r2=0xffff0005
+ar r3=0xfffffff0
+ar i0=0x00000001
+ar i1=0x00000001
+aes 7
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+ar r16
+ar i1
+EOF
+EXPECT=<<EOF
+0xffffffff
+0xfffffff1
+0x0fffffff
+0xffffffff
+0x0001000e
+0x00000000
+0xfffdfff1
+0x00000001
+EOF
+RUN
+
+NAME=USSE ESIL for ima32 with a carry in (probe imae-modes)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001000c00d0
+aei
+aeim
+ar r1=0xfffffff0
+ar r2=0xffff0005
+ar r3=0xffffffff
+ar i2=0x00000001
+aes 1
+ar r10
+EOF
+EXPECT=<<EOF
+0x000fffb0
+EOF
+RUN
+
+NAME=USSE ESIL for ima16 with 8-bit sources: a byte of each lane's half (probe ima16-8bit)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001400100a003416001600110a003418001c00300a00341a001800310a00341c001000200a00341e001400000a0
+aei
+aeim
+ar r1=0x82ff0381
+ar r2=0x7f05fe02
+ar r3=0x00100020
+aes 6
+ar r10
+ar r11
+ar r12
+ar r13
+ar r14
+ar r15
+EOF
+EXPECT=<<EOF
+0x8f0b0722
+0xfc8179fe
+0x0f0b4622
+0xfc11f89e
+0x100b0522
+0x8f0b0722
+EOF
+RUN
+
+NAME=USSE ESIL for ima8: x + y * z per byte, wrapping or saturating (probe ima8)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 0341400100000098034160014004009886028101000000988602a10100080098
+aei
+aeim
+ar r1=0x40302010
+ar r2=0x04030201
+ar r3=0x01020304
+ar r4=0x80ff10f0
+ar r5=0x10200302
+ar r6=0x10101080
+aes 4
+ar r10
+ar r11
+ar r12
+ar r13
+EOF
+EXPECT=<<EOF
+0x44362614
+0xc3d5e5f3
+0x80ff40f0
+0xffff40ff
+EOF
+RUN
+
+NAME=USSE ESIL for ima32 as a dual-issue secondary: two 16-bit lanes (probe dual-issue-ima32)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 80004001804324d8
+aei
+aeim
+ar r1=0x00040009
+ar r2=0x00060003
+ar r3=0x000a000b
+ar i0=0x00050002
+ar i1=0x0009000d
+ar i2=0x00200300
+aes 1
+ar r10
+ar i0
+EOF
+EXPECT=<<EOF
+0x00040009
+0x004d031a
+EOF
+RUN
+
+NAME=USSE ESIL for ima32 after an fmad: b is the primary's source 1 (probe dual-issue-ima32)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001804320d8
+aei
+aeim
+ar r1=0x3fa00000
+ar r2=0x40600000
+ar r3=0x40200000
+ar i0=0x40900000
+ar i1=0x40c00000
+ar i2=0x41100000
+aes 1
+ar r10
+ar i0
+EOF
+EXPECT=<<EOF
+0x40dc0000
+0x77100000
+EOF
+RUN
+
+NAME=USSE ESIL for fmul after fadm: the primary's second product (probe dual-issue-shared)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001404328d8
+aei
+aeim
+ar r1=0x3fa00000
+ar r2=0x40600000
+ar r3=0x40200000
+ar i0=0x40900000
+ar i1=0x40c00000
+ar i2=0x41100000
+aes 1
+ar r10
+ar i0
+EOF
+EXPECT=<<EOF
+0x413e0000
+0x410c0000
+EOF
+RUN
+
+NAME=USSE ESIL for fmad after fssq: the second product plus c (probe dual-issue-shared)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 0301600100402cdc
+aei
+aeim
+ar r1=0x3fa00000
+ar r2=0x40600000
+ar r3=0x40200000
+ar i0=0x40900000
+ar i1=0x40c00000
+ar i2=0x41100000
+aes 1
+ar r11
+ar i0
+EOF
+EXPECT=<<EOF
+0x41940000
+0x41740000
+EOF
+RUN
+
+NAME=USSE ESIL for fmsa after fmad: the primary's result (probe dual-issue-shared)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03414001804020d8
+aei
+aeim
+ar r1=0x3fa00000
+ar r2=0x40600000
+ar r3=0x40200000
+ar i0=0x40900000
+ar i1=0x40c00000
+ar i2=0x41100000
+aes 1
+ar r10
+ar i0
+EOF
+EXPECT=<<EOF
+0x40dc0000
+0x40dc0000
+EOF
+RUN
+
+NAME=USSE ESIL for fadd after fminmax: max(a, b) - c (probe dual-issue-shared)
+FILE=malloc://1024
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 03416001c04224dc
+aei
+aeim
+ar r1=0x3fa00000
+ar r2=0x40600000
+ar r3=0x40200000
+ar i0=0x40900000
+ar i1=0x40c00000
+ar i2=0x41100000
+aes 1
+ar r11
+ar i0
+EOF
+EXPECT=<<EOF
+0x40200000
+0x3f800000
+EOF
+RUN
+
+NAME=USSE ESIL leaves bank 7 past i3, fmad + fmad16 and the derivatives alone
+FILE=malloc://256
+ARGS=-a usse -b 32
+CMDS=<<EOF
+wx 800240e100100328800080200310092803414001404020d88200400100002020
+e asm.esil=true
+pi 4
+EOF
+EXPECT=<<EOF
+mov r10, i5
+mov i4, r1
+fmad r10, r1, r2, r3+fmad16 i0, i0, i1, i2
+fdsx r10, r1, r2
 EOF
 RUN

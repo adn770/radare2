@@ -31,9 +31,10 @@ static bool reg_ok(const char *r) {
 	if (!*r || strlen (r) > 16) {
 		return false;
 	}
-	/* measured: i3 reads as i0 and drops writes; the text cannot tell bank 0's
-	 * i3 from bank 7's, so neither is modelled */
-	if (!strcmp (r, "i3")) {
+	/* measured: i3 and the bank-7 numbers past it read the other instances
+	 * of the 2x2 quad and drop writes; ESIL emulates one instance, and the
+	 * text cannot tell bank 0's i3 from bank 7's, so none is modelled */
+	if (r[0] == 'i' && isdigit ((unsigned char)r[1]) && atoi (r + 1) >= 3) {
 		return false;
 	}
 	snprintf (pat, sizeof pat, "\t%s\t", r);
@@ -51,7 +52,9 @@ static bool reg_ok(const char *r) {
  * forms, half-float and c10 operands and the multi-channel tests are left
  * without ESIL; a write mask is a repeat of four with gaps (measured). The
  * 8-bit colour operations, integer dot products, fpma, efo, fadm/fmsa/
- * fsubflr and statomic follow the third round of probes. The
+ * fsubflr and statomic follow the third round of probes; idiv, ima8, imae's
+ * modes, ima16's 8-bit formats, shift immediates and ~ amounts, Pn and the
+ * dual-issue pairs that share a unit follow the fifth. The
  * semantics follow the hardware probes (sgxhumation tools/usse-asm/probe.py).
  * Loads/stores follow memop.h,
  * including the fetch forms' extra element and the post-increment writeback;
@@ -225,7 +228,8 @@ static void src_int(RStrBuf *sb, const UsseSrc *s) {
  * may be inverted. Measured on the hardware (tools/usse-asm/probe.py):
  * iadd32/iaddu32 add src1's low half, sign- or zero-extended, to the 32-bit
  * src2; shl/shr by a register amount of 32 and over give 0, asr fills the
- * sign and rol takes the amount mod 32. Immediate amounts stay below 32. */
+ * sign and rol takes the amount mod 32, immediate amounts the same, and ~
+ * complements an amount first. */
 static bool alu_val(RStrBuf *sb, const char *op, const UsseSrc *a, const UsseSrc *b) {
 	if (a->inv || a->neg || a->abs || a->low || a->high || b->neg || b->abs || b->low || b->high) {
 		return false;
@@ -254,12 +258,35 @@ static bool alu_val(RStrBuf *sb, const char *op, const UsseSrc *a, const UsseSrc
 		}
 		return true;
 	}
-	if (b->inv) {
-		return false;
+	if (b->imm && b->inv) {
+		/* ~#imm: the complemented 32-bit amount (measured) */
+		UsseSrc c = *b;
+		c.inv = false;
+		c.val = ~b->val & 0xffffffff;
+		snprintf (c.tok, sizeof c.tok, "0x%"PFMT64x, c.val);
+		return alu_val (sb, op, a, &c);
+	}
+	if (b->imm && b->val > 31) {
+		/* measured: an immediate amount of 32 and over acts as a register one */
+		if (!strcmp (op, "shl") || !strcmp (op, "shr")) {
+			r_strbuf_append (sb, "0");
+		} else if (!strcmp (op, "asr")) {
+			r_strbuf_appendf (sb, "31,%s,ASR,0xffffffff,&", a->tok);
+		} else if (!strcmp (op, "rol")) {
+			UsseSrc c = *b;
+			c.val = b->val & 31;
+			snprintf (c.tok, sizeof c.tok, "%"PFMT64u, c.val);
+			return alu_val (sb, op, a, &c);
+		} else {
+			return false;
+		}
+		return true;
 	}
 	if (!b->imm) {
-		/* a register amount: any 32-bit value */
-		const char *x = a->tok, *y = b->tok;
+		/* a register amount: any 32-bit value, complemented by ~ (measured) */
+		char yb[48];
+		snprintf (yb, sizeof yb, b->inv ? "%s,0xffffffff,^" : "%s", b->tok);
+		const char *x = a->tok, *y = yb;
 		if (!strcmp (op, "shl")) {
 			r_strbuf_appendf (sb, "0xffffffe0,%s,&,!,31,%s,&,%s,<<,0xffffffff,&,*", y, y, x);
 		} else if (!strcmp (op, "shr")) {
@@ -272,9 +299,6 @@ static bool alu_val(RStrBuf *sb, const char *op, const UsseSrc *a, const UsseSrc
 			return false;
 		}
 		return true;
-	}
-	if (b->val > 31) {
-		return false;
 	}
 	const unsigned n = (unsigned) b->val;
 	if (!strcmp (op, "shl")) {
@@ -481,84 +505,291 @@ static void src_half(RStrBuf *sb, const UsseSrc *s, bool sign) {
 	}
 }
 
-/* imae.{u,s} d, a.{low,high}, b.{low,high}, c, u32: d = a16 * b16 + c, the
- * halves zero- (u) or sign-extended (s). The firmware adds with it
- * ("imae.u r2, r4.low, #1.low, r2, u32"). Saturating, carry, rs and 16-bit
- * src2 variants are not modelled. ima32.{u,s} d, a, b, c: d = a * b + c, the
- * low 32 bits (the same for either signedness). */
+/* imae.{u,s,usat,ssat}[.rsN] d, a.{low,high}, b.{low,high}, c, {u32,u16,z16}
+ * [, coe] [, cie] [, iN]: d = a16 * b16 + c, the halves zero- (u, usat) or
+ * sign-extended (s, ssat); the firmware adds with it ("imae.u r2, r4.low,
+ * #1.low, r2, u32"). Measured (probe imae-modes): .usat/.ssat saturate the
+ * sum, .rsN shifts it right, a u16 source 2 is its half sign-extended and a
+ * z16 one zero-extended, coe writes the carry out to iN and cie adds iN.
+ * ima32.{u,s} d, a, b, c [, cie, iN]: the low 32 bits of a * b + c [+ iN]. The
+ * sum is formed in ESIL's 64 bits; .rsN and coe only on the unsigned forms. */
 static bool imul_esil(RStrBuf *sb, const char *base, const char *opw, char **args, int argc) {
-	static const char * const us[] = { "u", NULL };
-	static const char * const ss[] = { "s", NULL };
-	const bool sign = has_flag (opw, "s");
-	bool nowrite;
+	static const char * const fl[] = { "u", "s", "usat", "ssat", "rs1", "rs2", "rs3", "rs4", "rs5",
+		"rs6", "rs7", NULL };
+	const bool imae = !strcmp (base, "imae");
+	const bool usat = has_flag (opw, "usat"), ssat = has_flag (opw, "ssat");
+	const bool sign = has_flag (opw, "s") || ssat;
+	const int kinds = has_flag (opw, "u") + has_flag (opw, "s") + usat + ssat;
+	int rs = 0, i, k, n = imae ? 5 : 4;
+	bool nowrite, coe = false, cie = false;
+	const char *ireg = NULL;
 	UsseSrc a, b, c;
-	if (sign == has_flag (opw, "u") || !flags_ok (opw, sign ? ss : us, NULL, NULL)) {
+	if (kinds != 1 || !flags_ok (opw, fl, NULL, NULL) || argc < n) {
 		return false;
 	}
-	if (!strcmp (base, "imae")) {
-		if (argc != 5 || strcmp (args[4], "u32")) {
+	for (i = 1; i < 8; i++) {
+		char f[8];
+		snprintf (f, sizeof f, "rs%d", i);
+		if (has_flag (opw, f)) {
+			rs = i;
+		}
+	}
+	if (!imae && (rs || usat || ssat)) {
+		return false;
+	}
+	for (k = n; k < argc; k++) {
+		if (!strcmp (args[k], "coe") && !coe && !cie && !ireg) {
+			coe = true;
+		} else if (!strcmp (args[k], "cie") && !cie && !ireg) {
+			cie = true;
+		} else if (!ireg && (coe || cie) && k == argc - 1 && reg_ok (args[k]) && args[k][0] == 'i') {
+			ireg = args[k];
+		} else {
 			return false;
 		}
-	} else if (argc != 4) {
+	}
+	if ((coe || cie) && !ireg) {
+		return false;
+	}
+	if ((coe && (sign || !imae)) || (rs && (sign || usat)) || (coe && (usat || rs))) {
 		return false;
 	}
 	if (!dst_ok (args[0], &nowrite) || nowrite || !src_parse (args[1], &a)
-			|| !src_parse (args[2], &b) || !src_parse (args[3], &c) || !src_plain (&c)) {
+			|| !src_parse (args[2], &b) || !src_parse (args[3], &c) || c.inv || c.neg || c.abs) {
 		return false;
 	}
-	r_strbuf_appendf (sb, "%s,", c.tok);
-	if (!strcmp (base, "imae")) {
-		if (a.inv || a.neg || a.abs || b.inv || b.neg || b.abs || a.low == a.high || b.low == b.high) {
-			return false;
-		}
-		src_half (sb, &b, sign);
-		r_strbuf_append (sb, ",");
-		src_half (sb, &a, sign);
-	} else {
-		if (!src_plain (&a) || !src_plain (&b)) {
-			return false;
-		}
-		r_strbuf_appendf (sb, "%s,%s", b.tok, a.tok);
+	/* ESIL has no temporaries: the forms that evaluate the sum more than once
+	 * must not overwrite one of its inputs on the way */
+	const bool d_src = !strcmp (args[0], a.tok) || !strcmp (args[0], b.tok) || !strcmp (args[0], c.tok);
+	if (((usat || ssat) && d_src) || (coe && (cie || !strcmp (ireg, a.tok) || !strcmp (ireg, b.tok)
+			|| !strcmp (ireg, c.tok) || !strcmp (ireg, args[0])))) {
+		return false;
 	}
-	r_strbuf_appendf (sb, ",*,+,%s,=", args[0]);
+	RStrBuf *S = r_strbuf_new ("");
+	if (imae) {
+		const bool c16 = strcmp (args[4], "u32") != 0;
+		if ((c16 && (c.imm || (strcmp (args[4], "u16") && strcmp (args[4], "z16"))))
+				|| (c16 && c.low == c.high) || (!c16 && (c.low || c.high))
+				|| a.inv || a.neg || a.abs || b.inv || b.neg || b.abs || a.low == a.high || b.low == b.high) {
+			r_strbuf_free (S);
+			return false;
+		}
+		if (c16 && usat && args[4][0] == 'u') {
+			/* a sign-extended source 2 can make the unsigned sum negative: unmeasured */
+			r_strbuf_free (S);
+			return false;
+		}
+		if (c16) {
+			c.val = 0;
+			src_half (S, &c, args[4][0] == 'u');
+		} else if (ssat) {
+			r_strbuf_appendf (S, "32,%s,~", c.tok);
+		} else {
+			r_strbuf_append (S, c.tok);
+		}
+		r_strbuf_append (S, ",");
+		src_half (S, &b, sign);
+		r_strbuf_append (S, ",");
+		src_half (S, &a, sign);
+	} else {
+		if (!src_plain (&a) || !src_plain (&b) || !src_plain (&c)) {
+			r_strbuf_free (S);
+			return false;
+		}
+		r_strbuf_appendf (S, "%s,%s,%s", c.tok, b.tok, a.tok);
+	}
+	r_strbuf_append (S, ",*,+");
+	if (cie) {
+		r_strbuf_appendf (S, ",%s,+", ireg);
+	}
+	const char *e = r_strbuf_get (S);
+	const char *d = args[0];
+	if (usat) {
+		/* ESIL's < is signed: test the bits above 32 instead */
+		r_strbuf_appendf (sb, "32,%s,>>,?{,0xffffffff,%s,=,},32,%s,>>,!,?{,%s,%s,=,}",
+			e, d, e, e, d);
+	} else if (ssat) {
+		/* in range when e + 2^31 fits in 32 bits; below it when bit 63 is set */
+		r_strbuf_appendf (sb, "32,0x80000000,%s,+,>>,!,?{,%s,%s,=,},"
+			"32,0x80000000,%s,+,>>,!,!,63,%s,>>,&,?{,0x80000000,%s,=,},"
+			"32,0x80000000,%s,+,>>,!,!,63,%s,>>,!,&,?{,0x7fffffff,%s,=,}",
+			e, e, d, e, e, d, e, e, d);
+	} else if (coe) {
+		r_strbuf_appendf (sb, "1,32,%s,>>,&,%s,=,%s,%s,=", e, ireg, e, d);
+	} else if (rs) {
+		r_strbuf_appendf (sb, "%d,%s,>>,%s,=", rs, e, d);
+	} else {
+		r_strbuf_appendf (sb, "%s,%s,=", e, d);
+	}
+	r_strbuf_free (S);
 	return true;
 }
 
-/* ima16.{s,u} d, a, b, c[.neg], u16, u16: in each 16-bit lane a * b + c (or
- * - c), wrapping; an immediate b or c is in both lanes (measured; the low 16
- * bits of the product are the same signed or unsigned). The other formats
- * are not modelled. */
+static bool reg_split(const char *t, char *bank, size_t bn, int *num);
+static int split_ins(char *t, char **opw, char **args, int max);
+
+/* idiv d, a, b, drcN: the unsigned quotient to d and the remainder to d + 1,
+ * 0xffffffff to both for b = 0 (measured; the data fence only says when the
+ * results arrive). Not modelled when d or d + 1 is also a source. */
+static bool idiv_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
+	char bank[8], d1[24];
+	int num;
+	bool nowrite;
+	UsseSrc a, b;
+	if (argc != 4 || strncmp (args[3], "drc", 3) || !flags_ok (opw, NULL, NULL, NULL)
+			|| !dst_ok (args[0], &nowrite) || nowrite || !reg_split (args[0], bank, sizeof bank, &num)) {
+		return false;
+	}
+	snprintf (d1, sizeof d1, "%s%d", bank, num + 1);
+	if (!reg_ok (d1) || !src_parse (args[1], &a) || !src_plain (&a) || !src_parse (args[2], &b)
+			|| !src_plain (&b) || !strcmp (a.tok, args[0]) || !strcmp (a.tok, d1)
+			|| !strcmp (b.tok, args[0]) || !strcmp (b.tok, d1)) {
+		return false;
+	}
+	r_strbuf_appendf (sb, "%s,!,?{,0xffffffff,%s,=,0xffffffff,%s,=,},%s,!,!,?{,%s,%s,%%,%s,=,%s,%s,/,%s,=,}",
+		b.tok, args[0], d1, b.tok, b.tok, a.tok, d1, b.tok, a.tok, args[0]);
+	return true;
+}
+
+/* One lane of an ima16 source in format fmt: u16, or the .low/.high byte of
+ * the lane's half read as u8, s8 (sign-extended) or o8 (minus 128); measured
+ * (probes ima16, ima16-8bit). */
+static bool ima16_lane(RStrBuf *sb, const UsseSrc *s, const char *fmt, int h) {
+	if (!strcmp (fmt, "u16")) {
+		if (s->low || s->high) {
+			return false;
+		}
+		src_lane (sb, s, h);
+		return true;
+	}
+	const bool u8 = !strcmp (fmt, "u8"), s8 = !strcmp (fmt, "s8"), o8 = !strcmp (fmt, "o8");
+	if ((!u8 && !s8 && !o8) || s->imm || s->neg || s->low == s->high) {
+		return false;
+	}
+	char half[40], byte[56];
+	snprintf (half, sizeof half, h ? "16,%s,>>" : "%s,0xffff,&", s->tok);
+	snprintf (byte, sizeof byte, s->low ? "%s,0xff,&" : "8,%s,>>", half);
+	r_strbuf_appendf (sb, s8 ? "8,%s,~" : o8 ? "128,%s,-" : "%s", byte);
+	return true;
+}
+
+/* ima16.{s,u}[.rsN] d, a, b, c[.neg], fb, fc: in each 16-bit lane a * b + c
+ * (or - c), wrapping; an immediate b or c is in both lanes, a u8/s8/o8
+ * source reads a byte of its lane's half (measured; the low 16 bits of the
+ * product are the same signed or unsigned). .rsN shifts the lane's full
+ * result right first (measured with unsigned sources only, so modelled so). */
 static bool ima16_esil(RStrBuf *sb, const char *opw, char **args, int argc) {
-	static const char * const us[] = { "u", NULL };
-	static const char * const ss[] = { "s", NULL };
+	static const char * const fl[] = { "u", "s", "rs1", "rs2", "rs3", "rs4", "rs5", "rs6", "rs7", NULL };
 	const bool sign = has_flag (opw, "s");
 	bool nowrite;
 	UsseSrc a, b, c;
-	int h;
-	if (argc != 6 || strcmp (args[4], "u16") || strcmp (args[5], "u16")
-			|| sign == has_flag (opw, "u") || !flags_ok (opw, sign ? ss : us, NULL, NULL)) {
+	int h, rs = 0;
+	if (argc != 6 || sign == has_flag (opw, "u") || !flags_ok (opw, fl, NULL, NULL)) {
 		return false;
+	}
+	for (h = 1; h < 8; h++) {
+		char f[8];
+		snprintf (f, sizeof f, "rs%d", h);
+		if (has_flag (opw, f)) {
+			rs = h;
+		}
 	}
 	if (!dst_ok (args[0], &nowrite) || nowrite || !src_parse (args[1], &a)
 			|| !src_parse (args[2], &b) || !src_parse (args[3], &c)) {
 		return false;
 	}
-	if (!src_plain (&a) || a.imm || !src_plain (&b) || c.inv || c.abs || c.low || c.high) {
+	if (!src_plain (&a) || a.imm || b.inv || b.neg || b.abs || c.inv || c.abs
+			|| (c.neg && strcmp (args[5], "u16"))) {
+		return false;
+	}
+	if (rs && (sign || c.neg || args[4][0] != 'u' || args[5][0] != 'u')) {
 		return false;
 	}
 	for (h = 0; h < 2; h++) {
 		if (h) {
 			r_strbuf_append (sb, ",");
 		}
-		src_lane (sb, &c, h);
+		if (!ima16_lane (sb, &c, args[5], h)) {
+			return false;
+		}
 		r_strbuf_append (sb, ",");
-		src_lane (sb, &b, h);
+		if (!ima16_lane (sb, &b, args[4], h)) {
+			return false;
+		}
 		r_strbuf_append (sb, ",");
 		src_lane (sb, &a, h);
-		r_strbuf_appendf (sb, ",*,%s,0xffff,&%s", c.neg ? "-" : "+", h ? ",0x10000,*,|" : "");
+		r_strbuf_appendf (sb, ",*,%s", c.neg ? "-" : "+");
+		if (rs) {
+			r_strbuf_appendf (sb, ",%d,SWAP,>>", rs);
+		}
+		r_strbuf_appendf (sb, ",0xffff,&%s", h ? ",0x10000,*,|" : "");
 	}
 	r_strbuf_appendf (sb, ",%s,=", args[0]);
 	return true;
+}
+
+/* ima8[.sat] d, a, b, c, x, y, z, xa, ya, za: per byte x + y * z, the colour
+ * selectors x, y, z for bytes 0-2 and the alpha ones for byte 3 (s0, s1, s2:
+ * a, b, c; .comp: 255 - the byte), wrapping, or clamped to 255 with .sat
+ * (measured, probe ima8). Other selectors and modified sources are not. */
+static bool ima8_esil(RStrBuf *sb, const char *opw, const char *text) {
+	static const char * const fl[] = { "sat", NULL };
+	char *t = strdup (text), *w, *v[12];
+	int n, i, k;
+	bool ok = false, nowrite;
+	const bool sat = has_flag (opw, "sat");
+	if (!t || !flags_ok (opw, fl, NULL, NULL)) {
+		free (t);
+		return false;
+	}
+	n = split_ins (t, &w, v, 12);
+	if (n != 10 || !dst_ok (v[0], &nowrite) || nowrite) {
+		goto out;
+	}
+	for (i = 1; i < 4; i++) {
+		if (!simple_tok (v[i]) || v[i][0] == '#') {
+			goto out;
+		}
+	}
+	for (k = 0; k < 4; k++) {
+		const char *e[3];
+		char eb[3][64];
+		for (i = 0; i < 3; i++) {
+			const char *sel = v[(k == 3 ? 7 : 4) + i];
+			const bool comp = strstr (sel, ".comp") != NULL;
+			const size_t len = strcspn (sel, ".");
+			if (sel[0] != 's' || sel[1] < '0' || sel[1] > '2' || len != (k == 3 ? 3u : 2u)
+					|| (k == 3 && sel[2] != 'a') || (sel[len] && strcmp (sel + len, ".comp"))) {
+				goto out;
+			}
+			const char *reg = v[1 + sel[1] - '0'];
+			if (k) {
+				snprintf (eb[i], sizeof eb[i], comp ? "0xff,%d,%s,>>,&,0xff,-" : "0xff,%d,%s,>>,&", 8 * k, reg);
+			} else {
+				snprintf (eb[i], sizeof eb[i], comp ? "0xff,%s,&,0xff,-" : "0xff,%s,&", reg);
+			}
+			e[i] = eb[i];
+		}
+		if (k) {
+			r_strbuf_append (sb, ",");
+		}
+		char tv[220];
+		snprintf (tv, sizeof tv, "%s,%s,*,%s,+", e[2], e[1], e[0]);
+		if (sat) {
+			/* min(t, 255) = t - (255 < t) * (t - 255) */
+			r_strbuf_appendf (sb, "0xff,%s,-,%s,0xff,<,*,%s,-,%d,SWAP,<<", tv, tv, tv, 8 * k);
+		} else {
+			r_strbuf_appendf (sb, "%s,0xff,&,%d,SWAP,<<", tv, 8 * k);
+		}
+		if (k) {
+			r_strbuf_append (sb, ",|");
+		}
+	}
+	r_strbuf_appendf (sb, ",%s,=", v[0]);
+	ok = true;
+out:
+	free (t);
+	return ok;
 }
 
 /* Flush a binary32 on the stack to zero when it is a denormal, keeping its
@@ -2530,6 +2761,125 @@ out:
 	return ok;
 }
 
+/* The dual-issue words whose operations share a unit, measured (probes
+ * dual-issue-ima32, dual-issue-shared): an ima32 secondary computes two 16-bit
+ * lanes and, after fmad/fadm/fmsa/fssq, takes the primary's source 1 as b; a
+ * multiplying secondary of fadm/fmsa/fssq gets the primary's second product
+ * (fmad adds its own c); an fmsa secondary of fmad/fadm/fmsa and an ima32 one
+ * of ima32 write the primary's result; fadd/fsub/fmad after fminmax give
+ * max(a, b) - c. Returns false when the pair is none of these (*ok untouched);
+ * otherwise *ok says whether it could be modelled. No repeats. */
+static bool dual_shared(RStrBuf *sb, const char *pbase, const char *popw, char **pa, int pn,
+		const char *sop, char **sa, int sn, bool *ok) {
+	const bool two = !strcmp (pbase, "fadm") || !strcmp (pbase, "fmsa") || !strcmp (pbase, "fssq");
+	const bool mul = !strcmp (sop, "fmul") || !strcmp (sop, "fmad");
+	const bool copy = (!strcmp (sop, "fmsa") && (!strcmp (pbase, "fmad") || two) && strcmp (pbase, "fssq"))
+		|| (!strcmp (sop, "ima32") && !strcmp (pbase, "ima32"));
+	const bool mm = !strcmp (pbase, "fminmax") && (!strcmp (sop, "fadd") || !strcmp (sop, "fsub")
+		|| !strcmp (sop, "fmad"));
+	const bool lanes = !strcmp (sop, "ima32") && (!strcmp (pbase, "mov") || !strcmp (pbase, "fmad") || two);
+	if (!(two && mul) && !copy && !mm && !lanes) {
+		return false;
+	}
+	EArena a = { r_list_newf (free) }, *ar = &a;
+	RStrBuf *P = r_strbuf_new (""), *S = r_strbuf_new ("");
+	char pd[24], sd[24], r[24];
+	bool nowrite, s_first = false;
+	int i;
+	*ok = false;
+	if (has_flag (popw, "repeat2") || !dst_ok (sa[0], &nowrite) || nowrite || strchr (sa[0], '.')
+			|| !dual_one (P, pbase, pa, pn, true)) {
+		goto out;
+	}
+	op_reg (pa[0], pd, sizeof pd);
+	op_reg (sa[0], sd, sizeof sd);
+	if (copy) {
+		/* the primary's result, after the primary has written it */
+		if (sn != 4) {
+			goto out;
+		}
+		r_strbuf_appendf (S, "%s,%s,=", pd, sd);
+	} else if (lanes) {
+		UsseSrc x, y, z;
+		const char *b1 = !strcmp (pbase, "mov") ? sa[2] : !strcmp (pbase, "fssq") ? pa[1] : pa[2];
+		int h;
+		if (sn != 4 || !src_parse (sa[1], &x) || !src_plain (&x) || x.imm || !src_parse (b1, &y)
+				|| !src_plain (&y) || y.imm || !src_parse (sa[3], &z) || !src_plain (&z) || z.imm) {
+			goto out;
+		}
+		for (h = 0; h < 2; h++) {
+			if (h) {
+				r_strbuf_append (S, ",");
+			}
+			src_lane (S, &z, h);
+			r_strbuf_append (S, ",");
+			src_lane (S, &y, h);
+			r_strbuf_append (S, ",");
+			src_lane (S, &x, h);
+			r_strbuf_appendf (S, ",*,+,0xffff,&%s", h ? ",0x10000,*,|" : "");
+		}
+		r_strbuf_appendf (S, ",%s,=", sd);
+		s_first = true;
+	} else {
+		const char *v;
+		if (mm) {
+			const char *x = pn == 4 ? f_src (ar, pa[1]) : NULL, *y = pn == 4 ? f_src (ar, pa[2]) : NULL;
+			const char *c = pn == 4 ? f_src (ar, pa[3]) : NULL;
+			if (!x || !y || !c) {
+				goto out;
+			}
+			v = f_sum (ar, ea_put (ar, f_minmax (x, y, true)), c, true);
+		} else {
+			const bool sq = !strcmp (pbase, "fssq");
+			if (pn != (sq ? 3 : 4)) {
+				goto out;
+			}
+			const char *x = f_src (ar, pa[sq ? 2 : 2]);
+			const char *y = f_src (ar, pa[sq ? 2 : 3]);
+			if (!x || !y) {
+				goto out;
+			}
+			v = f_mul (ar, x, y);
+		}
+		if (!strcmp (sop, "fmad")) {
+			const char *c = sn == 4 ? f_src (ar, sa[3]) : NULL;
+			if (!c) {
+				goto out;
+			}
+			v = f_sum (ar, v, c, false);
+		} else if (sn != 3) {
+			goto out;
+		}
+		if (!v) {
+			goto out;
+		}
+		r_strbuf_appendf (S, "%s,%s,=", v, sd);
+		s_first = true;
+	}
+	if (s_first) {
+		/* the secondary reads the primary's sources: it goes first, so its
+		 * destination must not be one of them, nor the primary's */
+		for (i = 1; i < pn; i++) {
+			op_reg (pa[i], r, sizeof r);
+			if (!strcmp (r, sd)) {
+				goto out;
+			}
+		}
+		if (!strcmp (pd, sd)) {
+			goto out;
+		}
+		r_strbuf_appendf (sb, "%s,%s", r_strbuf_get (S), r_strbuf_get (P));
+	} else {
+		r_strbuf_appendf (sb, "%s,%s", r_strbuf_get (P), r_strbuf_get (S));
+	}
+	*ok = true;
+out:
+	r_strbuf_free (P);
+	r_strbuf_free (S);
+	r_list_free (a.l);
+	return true;
+}
+
 static bool dual_esil(RStrBuf *sb, const char *text) {
 	char *t = strdup (text), *plus = strchr (t, '+');
 	char *popw, *sopw, *pa[6], *sa[6];
@@ -2544,8 +2894,12 @@ static bool dual_esil(RStrBuf *sb, const char *text) {
 	char pbase[16];
 	snprintf (pbase, sizeof pbase, "%.*s", (int) strcspn (popw, "."), popw);
 	static const char * const rep[] = { "repeat2", NULL };
-	if (pn < 2 || sn < 2 || strchr (sopw, '.') || !flags_ok (popw, rep, NULL, NULL)
-			|| !dual_pair_ok (pbase, sopw)) {
+	if (pn < 2 || sn < 2 || strchr (sopw, '.') || !flags_ok (popw, rep, NULL, NULL)) {
+		goto out;
+	}
+	if (!dual_pair_ok (pbase, sopw)) {
+		/* the pairs that share a unit (measured) are modelled apart */
+		dual_shared (sb, pbase, popw, pa, pn, sopw, sa, sn, &ok);
 		goto out;
 	}
 	/* the order: the secondary last (it wins a shared destination), unless
@@ -2602,6 +2956,9 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 		cond[0] = 'p'; cond[1] = body[1]; body += 3;
 	} else if (body[0] == '!' && body[1] == 'p' && body[2] >= '0' && body[2] <= '3' && body[3] == ' ') {
 		neg = 1; cond[0] = 'p'; cond[1] = body[2]; body += 4;
+	} else if (body[0] == 'P' && body[1] == 'n' && body[2] == ' ') {
+		/* measured: Pn (predicate value 7) never runs the instruction */
+		cond[0] = '0'; body += 3;
 	}
 
 	const char *btext = text + (body - s);
@@ -2720,6 +3077,10 @@ static void usse_analyze(RAnalOp *op, const char *text, RArchDecodeMask mask) {
 			ok = imul_esil (ab, base, opw, args, argc);
 		} else if (!strcmp (base, "ima16")) {
 			ok = ima16_esil (ab, opw, args, argc);
+		} else if (!strcmp (base, "ima8")) {
+			ok = ima8_esil (ab, opw, btext);
+		} else if (!strcmp (base, "idiv")) {
+			ok = idiv_esil (ab, opw, args, argc);
 		} else if (!strcmp (base, "sop2") || !strcmp (base, "sop3") || !strcmp (base, "lrp1")
 				|| !strcmp (base, "lrp2") || !strcmp (base, "sop2wm")) {
 			ok = colour_esil (ab, base, opw, btext);
